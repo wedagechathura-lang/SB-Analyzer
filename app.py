@@ -30,30 +30,24 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     logs.append("---")
     
     # ==========================================================
-    # --- 2. HEAVY TEXTURE REMOVAL PIPELINE ---
+    # --- 2. IMPROVED PRE-PROCESSING (The Texture Fix) ---
     # ==========================================================
     gray = cv2.cvtColor(input_bgr, cv2.COLOR_BGR2GRAY)
     
-    # STEP A: Blur - Use Median Blur (Better for preserving edges on fabric)
-    # This removes "salt and pepper" noise better than Gaussian
-    blurred = cv2.medianBlur(gray, 21) 
+    # STEP A: Heavy Blur to melt the fabric threads together
+    # Increased from (7,7) to (35,35)
+    blurred = cv2.GaussianBlur(gray, (35, 35), 0)
     
-    # STEP B: Adaptive Threshold - STRICTER
-    # Block Size: 51 (checks large area)
-    # C (Constant): Increased to 25 (Was 15). 
-    # This means a pixel must be MUCH darker than neighbors to be detected.
+    # STEP B: Adaptive Threshold with a LARGER block size
+    # Block size increased from 15 to 81 (must be odd number)
+    # This looks at a wider area, ignoring small thread variations
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 51, 25)
+                                   cv2.THRESH_BINARY_INV, 81, 15)
     
-    # STEP C: "Open" to remove noise, then "Close" to connect gaps
-    # 1. Erase tiny white dots (Erosion)
-    kernel_erase = np.ones((5, 5), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_erase)
-    
-    # 2. Connect broken lines (Dilation/Closing) - CRITICAL STEP
-    # This melts the broken circle segments back together
-    kernel_connect = np.ones((15, 15), np.uint8) # Large kernel to bridge gaps
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_connect)
+    # STEP C: Morphological "Opening" (Erosion followed by Dilation)
+    # This effectively "wipes away" any small white noise speckles left over
+    kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     
     # ==========================================================
     
@@ -62,16 +56,9 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     detected_shapes = []
     
     for cnt in contours:
-        # Increased minimum filtering to ignore remaining texture blobs
-        # Must be at least 500 pixels area to even be considered
-        if len(cnt) >= 10 and cv2.contourArea(cnt) > 500:
-            
-            # Use Convex Hull to smooth out the rough edges of the marker
-            hull = cv2.convexHull(cnt)
-            
-            if len(hull) < 5: continue
-            
-            ellipse = cv2.fitEllipse(hull)
+        # Filter very small artifacts
+        if len(cnt) >= 5 and cv2.contourArea(cnt) > 100:
+            ellipse = cv2.fitEllipse(cnt)
             major = max(ellipse[1])
             minor = min(ellipse[1])
             
@@ -97,16 +84,8 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     
     if len(detected_shapes) > num_ovals:
         detected_shapes = detected_shapes[:num_ovals]
-        # Sort again by Y-position (top to bottom) to keep labels consistent
-        # This helps if you have 4 circles vertical
-        detected_shapes.sort(key=lambda s: s['ellipse'][0][1])
     
-    # Identify Reference (Assume Topmost is Ref, or Roundest? Let's stick to Roundest for now)
-    # Actually, if you have a vertical strip, usually the top or bottom is ref.
-    # Let's keep your logic: The "Roundest" (highest ratio) is the reference.
-    # We need to re-find the roundest one after sorting by position
-    ref_shape = max(detected_shapes, key=lambda s: s['ratio'])
-    
+    ref_shape = detected_shapes[0]
     ref_maj = ref_shape['major']
     ref_min = ref_shape['minor']
     
