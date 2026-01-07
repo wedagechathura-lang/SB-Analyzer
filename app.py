@@ -3,14 +3,11 @@ import cv2
 import numpy as np
 from PIL import Image
 
-
-
 # ==========================================
 # 1. CORE ANALYSIS LOGIC
 # ==========================================
 def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area_percent):
     # --- 1. SAFETY RESIZE (Prevents Memory Crashes) ---
-    # Resize extremely large images to a max width of 1600px
     if image.width > 1600:
         ratio = 1600 / image.width
         new_height = int(image.height * ratio)
@@ -37,6 +34,8 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     # --- 2. Pre-processing ---
     gray = cv2.cvtColor(input_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    # This creates the Black & White Image
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 15, 4)
     
@@ -45,7 +44,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     detected_shapes = []
     
     for cnt in contours:
-        # Basic noise filter
         if len(cnt) >= 5 and cv2.contourArea(cnt) > 20:
             ellipse = cv2.fitEllipse(cnt)
             major = max(ellipse[1])
@@ -55,7 +53,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             
             ellipse_area = np.pi * (major / 2) * (minor / 2)
             
-            # User Slider Filter
             if ellipse_area > min_area_threshold:
                 aspect_ratio = minor / major
                 detected_shapes.append({
@@ -67,7 +64,8 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 })
             
     if not detected_shapes:
-        return output_image, logs + [f"**Error:** No shapes found larger than {min_area_percent}%."], None
+        # RETURN BINARY IMAGE EVEN ON ERROR
+        return output_image, logs + [f"**Error:** No shapes found larger than {min_area_percent}%."], None, binary
         
     # --- 4. Identify Reference & Calculate Stress ---
     detected_shapes.sort(key=lambda s: s['ratio'], reverse=True)
@@ -88,20 +86,16 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
         center = (center_x, center_y)
 
         if s == ref_shape:
-            # Reference Shape Logic
-            cv2.ellipse(output_image, s['ellipse'], (0, 0, 255), 3) # Red for Ref
+            cv2.ellipse(output_image, s['ellipse'], (0, 0, 255), 3) 
             logs.append(f"**Shape #{i+1} (Reference)**")
             logs.append(f"- Location: ({center_x}, {center_y})")
-            # RESTORED: Area percentage calculation
             logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
             logs.append("---")
-            
             cv2.putText(output_image, "Ref", (center[0] - 40, center[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             shape_data_for_map.append((center_x, center_y, 0.0))
         else:
-            # Sensor Shape Logic
-            cv2.ellipse(output_image, s['ellipse'], (0, 255, 0), 3) # Green for Sensor
+            cv2.ellipse(output_image, s['ellipse'], (0, 255, 0), 3) 
             curr_maj = s['major']
             curr_min = s['minor']
             
@@ -114,23 +108,18 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             
             logs.append(f"**Shape #{i+1} (Sensor)**")
             logs.append(f"- Location: ({center_x}, {center_y})")
-            # RESTORED: Area percentage calculation
             logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
             logs.append(f"- Stress: {stress_mpa:.2f} MPa")
             logs.append("---")
             
             cv2.putText(output_image, f"{stress_mpa:.2f} MPa", (center[0] - 60, center[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            
             shape_data_for_map.append((center_x, center_y, stress_mpa))
 
-    # --- 5. OPTIMIZED TOPOGRAPHY MAP (Low Memory) ---
+    # --- 5. TOPOGRAPHY MAP (Low Memory) ---
     if len(shape_data_for_map) > 0:
         try:
             h, w = output_image.shape[:2]
-            
-            # Create a tiny grid for calculation (1/10th scale)
-            # This reduces memory usage by 100x
             small_w, small_h = w // 10, h // 10
             small_w = max(small_w, 1)
             small_h = max(small_h, 1)
@@ -154,7 +143,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 interpolated_values_flat = np.sum(weights * values, axis=1) / sum_of_weights
                 interpolated_stress_map = interpolated_values_flat.reshape(small_h, small_w)
 
-            # Normalize and Color the small map
             min_s, max_s = np.min(interpolated_stress_map), np.max(interpolated_stress_map)
             if (max_s - min_s) == 0:
                 normalized_map = np.zeros_like(interpolated_stress_map, dtype=np.uint8)
@@ -163,16 +151,16 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 normalized_map = normalized_map.astype(np.uint8)
 
             color_map_small = cv2.applyColorMap(normalized_map, cv2.COLORMAP_JET)
-            
-            # Resize the color map back up to full size to overlay
             color_map_full = cv2.resize(color_map_small, (w, h), interpolation=cv2.INTER_LINEAR)
-            
             output_image = cv2.addWeighted(color_map_full, 0.4, output_image, 0.6, 0)
             
         except Exception as e:
             logs.append(f"**Map Error:** {e}")
 
-    return output_image, logs, shape_data_for_map
+    # RETURN THE BINARY IMAGE AS THE 4TH ITEM
+    return output_image, logs, shape_data_for_map, binary
+
+
 # ==========================================
 # 2. MOBILE APP INTERFACE
 # ==========================================
@@ -187,15 +175,9 @@ with st.expander("Analysis Parameters", expanded=True):
     with col1:
         modulus = st.number_input("Modulus (MPa)", value=51.0)
         strain_factor = st.number_input("Strain Factor", value=2.0)
-        
-        # --- NEW 0-100% SLIDER ---
         min_area_percent = st.slider(
             "Min Circle Area (% of Screen)",
-            min_value=0.1,    # Minimum 0.1%
-            max_value=100.0,  # Maximum 100%
-            value=1.0,        # Default 1%
-            step=0.1,
-            format="%.1f%%"
+            min_value=0.1, max_value=100.0, value=1.0, step=0.1, format="%.1f%%"
         )
         
     with col2:
@@ -209,12 +191,20 @@ if image_file is not None:
         with st.spinner("Processing..."):
             original_image = Image.open(image_file)
             
-            result_img, logs, map_data = run_analysis(
+            # UNPACK 4 ITEMS NOW
+            result_img, logs, map_data, binary_img = run_analysis(
                 original_image, modulus, poisson, num_ovals, strain_factor, min_area_percent
             )
             
             st.image(result_img, caption="Analysis Result", use_container_width=True, channels="BGR")
             
             st.success("Analysis Complete")
+            
+            # Show Logs
             for line in logs:
                 st.markdown(line)
+                
+            # Show Binary Image (New Feature)
+            st.markdown("### 🔍 Computer Vision View")
+            st.caption("This is what the computer sees (Thresholded Image):")
+            st.image(binary_img, caption="Binary/Threshold Mask", use_container_width=True, clamp=True)
