@@ -7,18 +7,16 @@ from PIL import Image
 # 1. CORE ANALYSIS LOGIC
 # ==========================================
 def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area_percent):
-    # --- 1. SAFETY RESIZE (Prevents Memory Crashes) ---
+    # --- 1. SAFETY RESIZE ---
     if image.width > 1600:
         ratio = 1600 / image.width
         new_height = int(image.height * ratio)
         image = image.resize((1600, new_height))
         
-    # Convert PIL image to OpenCV format (BGR)
     image_np = np.array(image.convert('RGB'))
     input_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     output_image = input_bgr.copy()
     
-    # --- Calculate Image Dimensions & Threshold ---
     img_h, img_w = input_bgr.shape[:2]
     total_image_pixels = img_h * img_w
     
@@ -28,23 +26,38 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     
     logs = []
     logs.append(f"**Image Size:** {img_w} x {img_h} ({total_image_pixels:,} px)")
-    logs.append(f"**Filter:** Ignoring circles smaller than {min_area_percent}% ({min_area_threshold:,.0f} px)")
+    logs.append(f"**Filter:** Ignoring circles smaller than {min_area_percent}%")
     logs.append("---")
     
-    # --- 2. Pre-processing ---
+    # ==========================================================
+    # --- 2. IMPROVED PRE-PROCESSING (The Texture Fix) ---
+    # ==========================================================
     gray = cv2.cvtColor(input_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # This creates the Black & White Image
+    # STEP A: Heavy Blur to melt the fabric threads together
+    # Increased from (7,7) to (35,35)
+    blurred = cv2.GaussianBlur(gray, (35, 35), 0)
+    
+    # STEP B: Adaptive Threshold with a LARGER block size
+    # Block size increased from 15 to 81 (must be odd number)
+    # This looks at a wider area, ignoring small thread variations
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 4)
+                                   cv2.THRESH_BINARY_INV, 81, 15)
+    
+    # STEP C: Morphological "Opening" (Erosion followed by Dilation)
+    # This effectively "wipes away" any small white noise speckles left over
+    kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    
+    # ==========================================================
     
     # --- 3. Find Contours ---
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detected_shapes = []
     
     for cnt in contours:
-        if len(cnt) >= 5 and cv2.contourArea(cnt) > 20:
+        # Filter very small artifacts
+        if len(cnt) >= 5 and cv2.contourArea(cnt) > 100:
             ellipse = cv2.fitEllipse(cnt)
             major = max(ellipse[1])
             minor = min(ellipse[1])
@@ -64,7 +77,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 })
             
     if not detected_shapes:
-        # RETURN BINARY IMAGE EVEN ON ERROR
         return output_image, logs + [f"**Error:** No shapes found larger than {min_area_percent}%."], None, binary
         
     # --- 4. Identify Reference & Calculate Stress ---
@@ -77,7 +89,7 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     ref_maj = ref_shape['major']
     ref_min = ref_shape['minor']
     
-    E = modulus_mpa * 1e6  # Pa
+    E = modulus_mpa * 1e6 
     shape_data_for_map = [] 
     
     for i, s in enumerate(detected_shapes):
@@ -89,7 +101,7 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             cv2.ellipse(output_image, s['ellipse'], (0, 0, 255), 3) 
             logs.append(f"**Shape #{i+1} (Reference)**")
             logs.append(f"- Location: ({center_x}, {center_y})")
-            logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
+            logs.append(f"- Area: {s['area_px']:.0f} px")
             logs.append("---")
             cv2.putText(output_image, "Ref", (center[0] - 40, center[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
@@ -108,7 +120,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             
             logs.append(f"**Shape #{i+1} (Sensor)**")
             logs.append(f"- Location: ({center_x}, {center_y})")
-            logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
             logs.append(f"- Stress: {stress_mpa:.2f} MPa")
             logs.append("---")
             
@@ -116,7 +127,7 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             shape_data_for_map.append((center_x, center_y, stress_mpa))
 
-    # --- 5. TOPOGRAPHY MAP (Low Memory) ---
+    # --- 5. TOPOGRAPHY MAP ---
     if len(shape_data_for_map) > 0:
         try:
             h, w = output_image.shape[:2]
@@ -157,7 +168,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
         except Exception as e:
             logs.append(f"**Map Error:** {e}")
 
-    # RETURN THE BINARY IMAGE AS THE 4TH ITEM
     return output_image, logs, shape_data_for_map, binary
 
 
