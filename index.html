@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Smart Bandage Analyzer</title>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.50.0/build/stlite.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      stlite.mount({
+        requirements: ["streamlit", "opencv-python", "numpy", "Pillow"],
+        entrypoint: "app.py", // This tells it to look for your other file
+        files: {
+          "app.py": {
+            url: "app.py", // This loads the file relative to the HTML
+          },
+        },
+      }, document.getElementById("root"));
+    </script>
+  </body>
+</html>
