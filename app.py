@@ -91,8 +91,11 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             # Reference Shape Logic
             cv2.ellipse(output_image, s['ellipse'], (0, 0, 255), 3) # Red for Ref
             logs.append(f"**Shape #{i+1} (Reference)**")
-            logs.append(f"- Loc: ({center_x}, {center_y}) | Area: {s['area_px']:.0f} px")
+            logs.append(f"- Location: ({center_x}, {center_y})")
+            # RESTORED: Area percentage calculation
+            logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
             logs.append("---")
+            
             cv2.putText(output_image, "Ref", (center[0] - 40, center[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             shape_data_for_map.append((center_x, center_y, 0.0))
@@ -110,7 +113,9 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             stress_mpa = stress_pa / 1e6
             
             logs.append(f"**Shape #{i+1} (Sensor)**")
-            logs.append(f"- Loc: ({center_x}, {center_y})")
+            logs.append(f"- Location: ({center_x}, {center_y})")
+            # RESTORED: Area percentage calculation
+            logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
             logs.append(f"- Stress: {stress_mpa:.2f} MPa")
             logs.append("---")
             
@@ -124,10 +129,9 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
         try:
             h, w = output_image.shape[:2]
             
-            # ERROR FIX: Create a tiny grid for calculation (e.g. 1/10th scale)
+            # Create a tiny grid for calculation (1/10th scale)
             # This reduces memory usage by 100x
             small_w, small_h = w // 10, h // 10
-            # Ensure at least 1 pixel
             small_w = max(small_w, 1)
             small_h = max(small_h, 1)
 
@@ -135,7 +139,6 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
             values = np.array([p[2] for p in shape_data_for_map]) 
             
             if len(points) == 1:
-                # Single color if only 1 point
                 interpolated_stress_map = np.full((small_h, small_w), values[0], dtype=np.float32)
             else:
                 y_grid, x_grid = np.mgrid[0:small_h, 0:small_w]
