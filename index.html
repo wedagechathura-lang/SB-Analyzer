@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PyScript External File</title>
+    <link rel="stylesheet" href="https://pyscript.net/latest/pyscript.css" />
+    <script defer src="https://pyscript.net/latest/pyscript.js"></script>
+</head>
+<body>
+    <h1>Running External Python Code</h1>
+    <div id="output-area"></div>
+
+    <py-config>
+        [[fetch]]
+        files = ["./app.py"]
+    </py-config>
+
+    <py-script>
+        # Import the file just like a normal Python module
+        import app
+
+        # specific function from your file
+        result = app.process_data()
+        
+        # Display the result in the 'output-area' div
+        display(result, target="output-area")
+    </py-script>
+</body>
+</html>
