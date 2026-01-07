@@ -9,6 +9,19 @@ from PIL import Image
 # 1. CORE ANALYSIS LOGIC
 # ==========================================
 def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area_percent):
+
+    # --- SAFETY RESIZE ---
+    # Resize if width is massive (e.g. > 2000px) to save memory
+    if image.width > 2000:
+        ratio = 2000 / image.width
+        new_height = int(image.height * ratio)
+        image = image.resize((2000, new_height))
+    # ---------------------
+
+    # Convert PIL image to OpenCV format (BGR)
+    image_np = np.array(image.convert('RGB'))
+    # ... rest of your code ...
+    
     # Convert PIL image to OpenCV format (BGR)
     image_np = np.array(image.convert('RGB'))
     # ... rest of your code ...
