@@ -9,16 +9,13 @@ from PIL import Image
 # 1. CORE ANALYSIS LOGIC
 # ==========================================
 def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area_percent):
-    # Convert PIL image to OpenCV format (BGR)
-    image_np = np.array(image.convert('RGB'))
-    # ... rest of your code ...
-    
-    # Convert PIL image to OpenCV format (BGR)
-    image_np = np.array(image.convert('RGB'))
-    # ... rest of your code ...
-    
-    
-    
+    # --- 1. SAFETY RESIZE (Prevents Memory Crashes) ---
+    # Resize extremely large images to a max width of 1600px
+    if image.width > 1600:
+        ratio = 1600 / image.width
+        new_height = int(image.height * ratio)
+        image = image.resize((1600, new_height))
+        
     # Convert PIL image to OpenCV format (BGR)
     image_np = np.array(image.convert('RGB'))
     input_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
@@ -28,46 +25,38 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     img_h, img_w = input_bgr.shape[:2]
     total_image_pixels = img_h * img_w
     
-    # Threshold Calculation:
-    # Example: 5% means we look for shapes bigger than 5% of the total screen
+    # Threshold Calculation
     ratio = min_area_percent / 100.0
     min_area_threshold = total_image_pixels * ratio
     
     logs = []
     logs.append(f"**Image Size:** {img_w} x {img_h} ({total_image_pixels:,} px)")
-    logs.append(f"**Filter:** Ignoring circles smaller than {min_area_percent}% of image ({min_area_threshold:,.0f} px)")
+    logs.append(f"**Filter:** Ignoring circles smaller than {min_area_percent}% ({min_area_threshold:,.0f} px)")
     logs.append("---")
     
-    # --- 1. Pre-processing ---
+    # --- 2. Pre-processing ---
     gray = cv2.cvtColor(input_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 15, 4)
     
-    # --- 2. Find Contours ---
+    # --- 3. Find Contours ---
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     detected_shapes = []
     
     for cnt in contours:
-        # Initial noise filter (very small dots) just to save speed
-        # We don't use the main threshold here yet!
+        # Basic noise filter
         if len(cnt) >= 5 and cv2.contourArea(cnt) > 20:
-            
-            # 1. Fit the Ellipse FIRST
             ellipse = cv2.fitEllipse(cnt)
             major = max(ellipse[1])
             minor = min(ellipse[1])
             
             if major == 0: continue
             
-            # 2. Calculate the Area of the FULL Ellipse
-            # Area = pi * radius_1 * radius_2
             ellipse_area = np.pi * (major / 2) * (minor / 2)
             
-            # 3. NOW Apply the Slider Filter
-            # This compares the full oval size, not just the ring pixels
+            # User Slider Filter
             if ellipse_area > min_area_threshold:
-                
                 aspect_ratio = minor / major
                 detected_shapes.append({
                     'ellipse': ellipse, 
@@ -78,15 +67,14 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 })
             
     if not detected_shapes:
-        return output_image, logs + [f"**Error:** No shapes found larger than {min_area_percent}% of the image."], None
+        return output_image, logs + [f"**Error:** No shapes found larger than {min_area_percent}%."], None
         
-    # --- 3. Identify Reference (Sort by Circularity) ---
+    # --- 4. Identify Reference & Calculate Stress ---
     detected_shapes.sort(key=lambda s: s['ratio'], reverse=True)
     
     if len(detected_shapes) > num_ovals:
         detected_shapes = detected_shapes[:num_ovals]
     
-    # Set Reference
     ref_shape = detected_shapes[0]
     ref_maj = ref_shape['major']
     ref_min = ref_shape['minor']
@@ -94,73 +82,63 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
     E = modulus_mpa * 1e6  # Pa
     shape_data_for_map = [] 
     
-    # --- 4. Calculate Stress & Draw ---
     for i, s in enumerate(detected_shapes):
-        # Draw outline
-        cv2.ellipse(output_image, s['ellipse'], (0, 255, 0), 3)
-        
         center_x = int(s['ellipse'][0][0])
         center_y = int(s['ellipse'][0][1])
         center = (center_x, center_y)
 
-        # Handle Reference
         if s == ref_shape:
-            color = (0, 0, 255) 
-            
+            # Reference Shape Logic
+            cv2.ellipse(output_image, s['ellipse'], (0, 0, 255), 3) # Red for Ref
             logs.append(f"**Shape #{i+1} (Reference)**")
-            logs.append(f"- Location: ({center_x}, {center_y})")
-            logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
+            logs.append(f"- Loc: ({center_x}, {center_y}) | Area: {s['area_px']:.0f} px")
+            logs.append("---")
+            cv2.putText(output_image, "Ref", (center[0] - 40, center[1]), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            shape_data_for_map.append((center_x, center_y, 0.0))
+        else:
+            # Sensor Shape Logic
+            cv2.ellipse(output_image, s['ellipse'], (0, 255, 0), 3) # Green for Sensor
+            curr_maj = s['major']
+            curr_min = s['minor']
+            
+            strain_maj = ((curr_maj - ref_maj) / ref_maj) * strain_factor
+            strain_min = ((curr_min - ref_min) / ref_min) * strain_factor
+            
+            term = (strain_maj + poisson * strain_min)
+            stress_pa = (E / (1 - poisson**2)) * term
+            stress_mpa = stress_pa / 1e6
+            
+            logs.append(f"**Shape #{i+1} (Sensor)**")
+            logs.append(f"- Loc: ({center_x}, {center_y})")
+            logs.append(f"- Stress: {stress_mpa:.2f} MPa")
             logs.append("---")
             
-            cv2.putText(output_image, "Ref", (center[0] - 40, center[1]), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-            
-            shape_data_for_map.append((center_x, center_y, 0.0))
-            continue
-            
-        # Measure Sensor
-        curr_maj = s['major']
-        curr_min = s['minor']
-        
-        strain_maj = ((curr_maj - ref_maj) / ref_maj) * strain_factor
-        strain_min = ((curr_min - ref_min) / ref_min) * strain_factor
-        
-        term = (strain_maj + poisson * strain_min)
-        stress_pa = (E / (1 - poisson**2)) * term
-        stress_mpa = stress_pa / 1e6
-        
-        logs.append(f"**Shape #{i+1} (Sensor)**")
-        logs.append(f"- Location: ({center_x}, {center_y})")
-        logs.append(f"- Area: {s['area_px']:.0f} px ({(s['area_px']/total_image_pixels)*100:.2f}%)")
-        logs.append(f"- Stress: {stress_mpa:.2f} MPa")
-        logs.append("---")
-        
-        # Draw Info on Image
-        y_text = center[1] - 50
-        info_lines = [
-            f"Maj: {curr_maj:.1f} px",
-            f"Strs: {stress_mpa:.2f} MPa"
-        ]
-        for line in info_lines:
-            cv2.putText(output_image, line, (center[0] - 80, y_text), 
+            cv2.putText(output_image, f"{stress_mpa:.2f} MPa", (center[0] - 60, center[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            y_text += 30
-        
-        shape_data_for_map.append((center_x, center_y, stress_mpa))
+            
+            shape_data_for_map.append((center_x, center_y, stress_mpa))
 
-    # --- 5. TOPOGRAPHY MAP ---
+    # --- 5. OPTIMIZED TOPOGRAPHY MAP (Low Memory) ---
     if len(shape_data_for_map) > 0:
         try:
             h, w = output_image.shape[:2]
-            interpolated_stress_map = np.zeros((h, w), dtype=np.float32)
             
-            points = np.array([(p[0], p[1]) for p in shape_data_for_map]) 
+            # ERROR FIX: Create a tiny grid for calculation (e.g. 1/10th scale)
+            # This reduces memory usage by 100x
+            small_w, small_h = w // 10, h // 10
+            # Ensure at least 1 pixel
+            small_w = max(small_w, 1)
+            small_h = max(small_h, 1)
+
+            points = np.array([(p[0]/10, p[1]/10) for p in shape_data_for_map]) 
             values = np.array([p[2] for p in shape_data_for_map]) 
             
             if len(points) == 1:
-                interpolated_stress_map.fill(values[0])
-            elif len(points) > 1:
-                y_grid, x_grid = np.mgrid[0:h, 0:w]
+                # Single color if only 1 point
+                interpolated_stress_map = np.full((small_h, small_w), values[0], dtype=np.float32)
+            else:
+                y_grid, x_grid = np.mgrid[0:small_h, 0:small_w]
                 pixel_coords_flat = np.vstack([x_grid.ravel(), y_grid.ravel()]).T 
                 points_reshaped = points[np.newaxis, :, :] 
                 pixel_coords_reshaped = pixel_coords_flat[:, np.newaxis, :] 
@@ -171,24 +149,27 @@ def run_analysis(image, modulus_mpa, poisson, num_ovals, strain_factor, min_area
                 weights = 1 / (distances**2)
                 sum_of_weights = np.sum(weights, axis=1)
                 interpolated_values_flat = np.sum(weights * values, axis=1) / sum_of_weights
-                interpolated_stress_map = interpolated_values_flat.reshape(h, w)
+                interpolated_stress_map = interpolated_values_flat.reshape(small_h, small_w)
 
+            # Normalize and Color the small map
             min_s, max_s = np.min(interpolated_stress_map), np.max(interpolated_stress_map)
-            
             if (max_s - min_s) == 0:
                 normalized_map = np.zeros_like(interpolated_stress_map, dtype=np.uint8)
             else:
                 normalized_map = 255 * (interpolated_stress_map - min_s) / (max_s - min_s)
                 normalized_map = normalized_map.astype(np.uint8)
 
-            color_map = cv2.applyColorMap(normalized_map, cv2.COLORMAP_JET)
-            output_image = cv2.addWeighted(color_map, 0.4, output_image, 0.6, 0)
+            color_map_small = cv2.applyColorMap(normalized_map, cv2.COLORMAP_JET)
+            
+            # Resize the color map back up to full size to overlay
+            color_map_full = cv2.resize(color_map_small, (w, h), interpolation=cv2.INTER_LINEAR)
+            
+            output_image = cv2.addWeighted(color_map_full, 0.4, output_image, 0.6, 0)
             
         except Exception as e:
             logs.append(f"**Map Error:** {e}")
 
     return output_image, logs, shape_data_for_map
-
 # ==========================================
 # 2. MOBILE APP INTERFACE
 # ==========================================
