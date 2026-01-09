@@ -10,13 +10,14 @@ from scipy.interpolate import griddata
 # ==========================================
 def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px, dot_min_area, dot_max_area):
     # --- 1. SAFETY RESIZE ---
-    # Prevents memory crashes on large images
+    # Prevents memory crashes on large images by limiting width to 1600px
     if image.width > 1600:
         ratio = 1600 / image.width
         new_height = int(image.height * ratio)
         image = image.resize((1600, new_height))
         
     image_np = np.array(image.convert('RGB'))
+    # OpenCV uses BGR format internaly
     input_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     output_image = input_bgr.copy()
     
@@ -37,7 +38,7 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 51, 15)
     
-    # Clean up noise (Morphological Open)
+    # Clean up noise (Morphological Open to remove tiny specks)
     kernel = np.ones((3, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     
@@ -57,9 +58,10 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
                 cY = int(M["m01"] / M["m00"])
                 dot_centers.append([cX, cY])
                 
-                # Draw a green circle around detected dots
+                # Draw a green circle around detected dots on the output image
                 cv2.drawContours(output_image, [cnt], -1, (0, 255, 0), 1)
 
+    # Basic error checking if not enough dots are found
     if len(dot_centers) < 3:
          return output_image, logs + [f"**Error:** Only found {len(dot_centers)} dots. Try adjusting the Min/Max Dot Area in the sidebar."], None, binary
 
@@ -94,7 +96,7 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
         strain = strain * strain_factor
         
         # Stress Calculation (Hooke's Law: Stress = E * Strain)
-        # Clamp negative strain (compression) to 0 stress for now
+        # Clamp negative strain (compression) to 0 stress for visualization
         if strain < 0: strain = 0
             
         stress_pa = E * strain
@@ -114,7 +116,7 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
     if len(shape_data_for_map) > 0:
         try:
             h, w = output_image.shape[:2]
-            # Create a smaller grid for faster interpolation (1/10th scale)
+            # Create a smaller grid for faster interpolation (1/10th scale) to save memory
             small_w, small_h = w // 10, h // 10
             small_w, small_h = max(small_w, 1), max(small_h, 1)
 
@@ -122,13 +124,13 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
             map_points = np.array([(p[0]/10, p[1]/10) for p in shape_data_for_map])
             map_values = np.array([p[2] for p in shape_data_for_map])
             
-            # Generate the grid mesh
+            # Generate the grid mesh for the new map
             y_grid, x_grid = np.mgrid[0:small_h, 0:small_w]
             
             # Perform Linear Interpolation to fill the space between dots
             interpolated_map = griddata(map_points, map_values, (x_grid, y_grid), method='linear', fill_value=0)
             
-            # Clean up any NaN values at the edges
+            # Clean up any NaN values at the edges resulting from interpolation
             interpolated_map = np.nan_to_num(interpolated_map)
             
             # Normalize map to 0-255 range for color mapping
@@ -141,7 +143,7 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
 
             # Apply color map (JET = Blue to Red)
             color_map_small = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
-            # Resize back to full image size
+            # Resize back to full image size using linear interpolation
             color_map_full = cv2.resize(color_map_small, (w, h), interpolation=cv2.INTER_LINEAR)
             
             # Overlay the heatmap onto the original image with transparency
@@ -150,6 +152,7 @@ def run_dot_analysis(image, modulus_mpa, poisson, strain_factor, ref_spacing_px,
         except Exception as e:
             logs.append(f"**Map Error:** {e}")
 
+    # Return BGR image, logs, data, and the binary mask
     return output_image, logs, shape_data_for_map, binary
 
 # ==========================================
@@ -170,7 +173,8 @@ with st.sidebar:
     
     st.header("2. Calibration (Crucial)")
     st.info("Adjust 'Ref Spacing' until the loose/relaxed parts of the bandage appear BLUE (0 MPa).")
-    ref_spacing = st.slider("Ref Spacing (px)", 10.0, 150.0, 45.0, 0.5, help="The distance between dots when there is NO tension.")
+    # Increased slider range to handle various image resolutions
+    ref_spacing = st.slider("Ref Spacing (px)", 10.0, 200.0, 45.0, 0.5, help="The distance between dots when there is NO tension.")
     
     st.divider()
     
@@ -188,17 +192,22 @@ if image_file is not None:
             original_image = Image.open(image_file)
             
             # Run the analysis function
-            result_img, logs, map_data, binary_img = run_dot_analysis(
+            result_img_bgr, logs, map_data, binary_img = run_dot_analysis(
                 original_image, modulus, 0.3, strain_factor, ref_spacing, min_area, max_area
             )
+            
+            # --- FIX FOR TYPE ERROR ---
+            # Explicitly convert BGR to RGB for Streamlit display.
+            # This is more reliable than using channels="BGR".
+            result_img_rgb = cv2.cvtColor(result_img_bgr, cv2.COLOR_BGR2RGB)
+            # ---------------------------
             
             # Create two columns for layout
             col1, col2 = st.columns([2, 1])
             
             with col1:
-                # Display the final heatmap image
-                # FIX: Use result_img and specify channels="BGR" for correct color display
-                st.image(result_img, caption="Stress Heatmap", use_container_width=True, channels="BGR")
+                # Display the final heatmap image using the RGB version
+                st.image(result_img_rgb, caption="Stress Heatmap", use_container_width=True)
             
             with col2:
                 st.markdown("### 📊 Analysis Logs")
@@ -208,5 +217,5 @@ if image_file is not None:
                 st.divider()
                 st.markdown("### 🔍 Computer Vision View")
                 st.caption("This is the binary mask used to find the dots.")
-                # Display the thresholded binary image
+                # Display the thresholded binary image (clamp=True handles 0-255 range safely)
                 st.image(binary_img, caption="Detected Dots (Threshold)", use_container_width=True, clamp=True)
