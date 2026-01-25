@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (HIGH SENSITIVITY)
+# 2. ANALYSIS LOGIC (WITH EXCLUSION ZONE)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     logs = []
@@ -58,51 +58,84 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     output = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # --- STEP 1: SEE THE SMALL DOTS ---
-    # Use minimal blur (3) so we don't erase small dots
+    # --- Preprocessing ---
     blurred = cv2.medianBlur(gray, 3) 
-    # Use tighter threshold to catch faint dots
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 11, 2)
     
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    dots = []
+    # ======================================================
+    # PASS 1: FIND THE REFERENCE SQUARE ONLY
+    # ======================================================
     ref_size_px = None 
+    ref_box = None # (x, y, w, h)
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        
-        # --- FIX 1: Allow Tiny Dots ---
-        # Was 50, changed to 5 to see your new small dots
-        if area < 5: continue 
+        if area < 100: continue 
         
         perimeter = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
         corners = len(approx)
         
-        # --- FIX 2: Allow Smaller Reference Square ---
-        # Was 500, changed to 100 to detect your new small square
-        if corners == 4 and area > 100: 
+        # Check for Square
+        if corners == 4: 
             x, y, w_rect, h_rect = cv2.boundingRect(cnt)
             ref_size_px = w_rect
-            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (255, 0, 0), 2)
-            logs.append(f"**CALIBRATION:** 1 Unit = {ref_size_px}px")
+            ref_box = (x, y, w_rect, h_rect)
             
-        else: 
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                dots.append([cx, cy])
+            # Draw the Square
+            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (255, 0, 0), 2)
+            logs.append(f"**CALIBRATION:** Found Square at ({x},{y}). 1 Unit = {ref_size_px}px")
+            break # Stop looking for the square once found
 
-    # --- FIX 3: Prevent Crash if Square Missing ---
     if ref_size_px is None:
-        return output, logs + ["ERROR: Reference Square not found. It might be too small or not square."], binary
+        return output, logs + ["ERROR: Reference Square not found."], binary
 
-    # --- FIX 4: Prevent Crash if Dots Missing ---
+    # ======================================================
+    # PASS 2: FIND DOTS (IGNORING THE EXCLUSION ZONE)
+    # ======================================================
+    dots = []
+    
+    # Define Exclusion Zone: 2.0x the size of the square
+    # This creates a "Safe Area" around the square where we ignore everything
+    exclusion_margin = ref_size_px * 2.0 
+    
+    ref_x, ref_y, ref_w, ref_h = ref_box
+    # Calculate the forbidden rectangle coordinates
+    safe_x1 = ref_x - exclusion_margin
+    safe_x2 = ref_x + ref_w + exclusion_margin
+    safe_y1 = ref_y - exclusion_margin
+    safe_y2 = ref_y + ref_h + exclusion_margin
+    
+    # Draw the Exclusion Zone (Yellow Dashed Box) for visualization
+    cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (0, 255, 255), 1)
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 5: continue 
+        
+        # Skip the square itself (we already found it)
+        perimeter = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
+        if len(approx) == 4 and area > 100: continue
+
+        # Get Dot Position
+        M = cv2.moments(cnt)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            
+            # --- THE IGNORE CHECK ---
+            # If the dot is inside the "Safe Box", SKIP IT.
+            if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
+                continue
+            
+            dots.append([cx, cy])
+
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Only found {len(dots)} dots. The code cannot run without dots."], binary
+        return output, logs + [f"ERROR: Only found {len(dots)} valid dots."], binary
 
     # --- KD-Tree Processing ---
     points = np.array(dots)
@@ -111,7 +144,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     
     heatmap_data = [] 
     
-    # If using small reference, the spacing is small, so we tighten the valid distance check
+    # Dynamic Edge Filter based on Reference Size
     max_valid_dist = ref_size_px * 2.5
     
     max_strain_val = -999.0 
@@ -119,7 +152,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     
     for i, d_list in enumerate(dist):
         neighbors = d_list[1:]
-        # Filter edge noise
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
@@ -160,7 +192,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         pts = np.float32([p[:2] for p in heatmap_data])
         vals = np.float32([p[2] for p in heatmap_data])
         
-        # High res grid for dense dots
         grid_x, grid_y = np.mgrid[0:w_img:4, 0:h_img:4]
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
@@ -228,7 +259,7 @@ if image_file is not None:
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Stress Heatmap")
-                st.image(result_img, channels="BGR", use_container_width=True)
+                st.image(result_img, use_container_width=True)
             
             with col2:
                 st.subheader("Data")
