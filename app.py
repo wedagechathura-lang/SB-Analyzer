@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (WITH EXCLUSION ZONE)
+# 2. ANALYSIS LOGIC (Smart Exclusion + Edge Filtering)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     logs = []
@@ -48,12 +48,12 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     image_np = np.array(image.convert('RGB'))
     img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     
-    # Resize Logic
     h, w = img.shape[:2]
     scale = 1.0
     if max(h, w) > 2000:
         scale = 2000 / max(h, w)
         img = cv2.resize(img, (0,0), fx=scale, fy=scale)
+        h, w = img.shape[:2] # Update dims
 
     output = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -66,10 +66,10 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     # ======================================================
-    # PASS 1: FIND THE REFERENCE SQUARE ONLY
+    # PASS 1: FIND REFERENCE SQUARE
     # ======================================================
     ref_size_px = None 
-    ref_box = None # (x, y, w, h)
+    ref_box = None 
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -77,58 +77,46 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         
         perimeter = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
-        corners = len(approx)
         
-        # Check for Square
-        if corners == 4: 
+        if len(approx) == 4: 
             x, y, w_rect, h_rect = cv2.boundingRect(cnt)
             ref_size_px = w_rect
             ref_box = (x, y, w_rect, h_rect)
-            
-            # Draw the Square
-            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (255, 0, 0), 2)
-            logs.append(f"**CALIBRATION:** Found Square at ({x},{y}). 1 Unit = {ref_size_px}px")
-            break # Stop looking for the square once found
+            logs.append(f"**CALIBRATION:** Found Square. 1 Unit = {ref_size_px}px")
+            break 
 
     if ref_size_px is None:
         return output, logs + ["ERROR: Reference Square not found."], binary
 
     # ======================================================
-    # PASS 2: FIND DOTS (IGNORING THE EXCLUSION ZONE)
+    # PASS 2: FIND DOTS & APPLY EXCLUSION ZONE
     # ======================================================
     dots = []
     
-    # Define Exclusion Zone: 2.0x the size of the square
-    # This creates a "Safe Area" around the square where we ignore everything
-    exclusion_margin = ref_size_px * 2.0 
+    # Exclusion Zone: 1.5x larger than the square itself
+    # This prevents detecting the square's rough edges as dots
+    ex_margin = ref_size_px * 0.8 # Add 80% padding around the square
+    rx, ry, rw, rh = ref_box
     
-    ref_x, ref_y, ref_w, ref_h = ref_box
-    # Calculate the forbidden rectangle coordinates
-    safe_x1 = ref_x - exclusion_margin
-    safe_x2 = ref_x + ref_w + exclusion_margin
-    safe_y1 = ref_y - exclusion_margin
-    safe_y2 = ref_y + ref_h + exclusion_margin
-    
-    # Draw the Exclusion Zone (Yellow Dashed Box) for visualization
-    cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (0, 255, 255), 1)
+    safe_x1 = rx - ex_margin
+    safe_x2 = rx + rw + ex_margin
+    safe_y1 = ry - ex_margin
+    safe_y2 = ry + rh + ex_margin
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < 5: continue 
         
-        # Skip the square itself (we already found it)
-        perimeter = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
-        if len(approx) == 4 and area > 100: continue
+        # Don't re-detect the big square
+        if area > (ref_size_px * ref_size_px * 0.8): continue
 
-        # Get Dot Position
         M = cv2.moments(cnt)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
             
-            # --- THE IGNORE CHECK ---
-            # If the dot is inside the "Safe Box", SKIP IT.
+            # --- EXCLUSION CHECK ---
+            # If dot is inside the "Reference Zone", ignore it
             if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
                 continue
             
@@ -143,12 +131,15 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     dist, indices = tree.query(points, k=5) 
     
     heatmap_data = [] 
-    
-    # Dynamic Edge Filter based on Reference Size
     max_valid_dist = ref_size_px * 2.5
     
     max_strain_val = -999.0 
     target_idx = -1
+    
+    # --- EDGE FILTER SETTINGS ---
+    # Ignore points within 10% of the image border
+    border_x = w * 0.10 
+    border_y = h * 0.10
     
     for i, d_list in enumerate(dist):
         neighbors = d_list[1:]
@@ -156,18 +147,22 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
 
         local_avg = np.mean(neighbors)
         
-        # Strain Calculation
         strain = (local_avg - ref_size_px) / ref_size_px
         strain = strain * strain_factor
-        
         strain_mag = abs(strain)
-        heatmap_data.append([points[i][0], points[i][1], strain_mag])
         
+        px, py = points[i]
+        heatmap_data.append([px, py, strain_mag])
+        
+        # --- NEW MAX SEARCH LOGIC ---
+        # 1. Must be the highest algebraic value (Tension)
+        # 2. Must NOT be near the edge of the image
         if strain > max_strain_val:
-            max_strain_val = strain
-            target_idx = i
+            if (px > border_x) and (px < (w - border_x)) and (py > border_y) and (py < (h - border_y)):
+                max_strain_val = strain
+                target_idx = i
 
-        cv2.circle(output, (int(points[i][0]), int(points[i][1])), 2, (0, 255, 0), -1)
+        cv2.circle(output, (int(px), int(py)), 2, (0, 255, 0), -1)
 
     # --- Physics Detail ---
     sig_x_disp = 0.0
@@ -184,7 +179,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         sig_x_disp = sx
         sig_y_disp = sy
         
-        logs.append(f"**Peak Tension:** {sx:.2f} MPa (X) / {sy:.2f} MPa (Y)")
+        logs.append(f"**Peak Tension (Internal):** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation ---
     if heatmap_data:
@@ -211,6 +206,14 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         mask_3ch = np.dstack([mask]*3)
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, output, 0.3, 0), output)
         
+        # --- FINAL MASKING: Hide the Reference Square Area ---
+        # Draw a semi-transparent gray box over the Exclusion Zone 
+        # so the heatmap doesn't show confusing interpolation there.
+        overlay = output.copy()
+        cv2.rectangle(overlay, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (50, 50, 50), -1)
+        output = cv2.addWeighted(overlay, 0.6, output, 0.4, 0)
+        
+        # Draw Label
         if target_idx != -1:
             mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
             label_x = f"Sx: {sig_x_disp:.2f} MPa"
@@ -226,7 +229,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
             cv2.putText(output, label_y, (mx+5, my-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2)
             cv2.circle(output, (mx, my), 5, (255, 0, 255), 2)
 
-    # Convert to RGB for Streamlit
     output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
     
     return output_rgb, logs, binary
@@ -235,7 +237,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
 # 3. STREAMLIT UI
 # ==========================================
 st.set_page_config(page_title="High Density Analyzer", layout="wide")
-
 st.title("🔬 High Density Stress Analyzer")
 
 with st.sidebar:
@@ -243,6 +244,7 @@ with st.sidebar:
     modulus = st.number_input("Young's Modulus (MPa)", value=51.0)
     poisson = st.number_input("Poisson's Ratio", value=0.3)
     strain_factor = st.number_input("Calibration Factor", value=1.0)
+    st.info("Now ignores edge artifacts and masks the reference square area.")
 
 image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
 
@@ -259,12 +261,12 @@ if image_file is not None:
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Stress Heatmap")
-                st.image(result_img, channels="BGR", use_container_width=True)
+                st.image(result_img, use_container_width=True)
             
             with col2:
                 st.subheader("Data")
                 for line in logs:
                     st.markdown(line)
                 
-                with st.expander("Binary Mask (See what was detected)"):
+                with st.expander("Binary Mask"):
                     st.image(binary_view, caption="Detected Dots", use_container_width=True)
