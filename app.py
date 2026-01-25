@@ -52,7 +52,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC
+# 2. ANALYSIS LOGIC (High Sensitivity)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     logs = []
@@ -72,11 +72,18 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     output = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # --- Preprocessing ---
-    blurred = cv2.medianBlur(gray, 7)
-    binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 5)
+    # --- Preprocessing (UPDATED FOR SMALL DOTS) ---
+    # 1. Use lighter blur to preserve small dots (Was 7, now 3)
+    blurred = cv2.medianBlur(gray, 3) 
     
+    # 2. Use tighter thresholding (Block 11, C 2)
+    binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # 3. Optional: Dilate slightly to make tiny dots "fatter" and easier to find
+    kernel = np.ones((2,2), np.uint8)
+    binary = cv2.dilate(binary, kernel, iterations=1)
+
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     dots = []
@@ -85,7 +92,9 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     # --- Detection Loop ---
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 50: continue 
+        
+        # --- FIX: Lowered limit to 5 pixels (was 50) ---
+        if area < 5: continue 
         
         perimeter = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
@@ -99,7 +108,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
             logs.append(f"**CALIBRATION:** 1 Unit = {ref_size_px}px")
             
         # Dots
-        elif corners > 6 or area > 100: 
+        else: # Accepting blobs as dots even if corners aren't perfect circles
             M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
@@ -107,8 +116,11 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
                 dots.append([cx, cy])
 
     if ref_size_px is None:
-        return output, logs + ["ERROR: Reference Square not found."], None
+        return output, logs + ["ERROR: Reference Square not found."], binary
     
+    if len(dots) < 5:
+        return output, logs + [f"ERROR: Only found {len(dots)} dots. Check lighting."], binary
+
     # --- KD-Tree Processing ---
     points = np.array(dots)
     tree = cKDTree(points)
@@ -140,8 +152,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
             max_strain_val = strain
             target_idx = i
 
-        # Draw green dot
-        cv2.circle(output, (int(points[i][0]), int(points[i][1])), 3, (0, 255, 0), -1)
+        # Draw green dot (Smaller radius for small dots)
+        cv2.circle(output, (int(points[i][0]), int(points[i][1])), 2, (0, 255, 0), -1)
 
     # --- Pass 2: Detailed Physics for Hotspot ---
     sig_x_disp = 0.0
@@ -169,7 +181,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         pts = np.float32([p[:2] for p in heatmap_data])
         vals = np.float32([p[2] for p in heatmap_data])
         
-        grid_x, grid_y = np.mgrid[0:w_img:10, 0:h_img:10]
+        # Use finer grid for small dots
+        grid_x, grid_y = np.mgrid[0:w_img:5, 0:h_img:5] # 1/5th scale for better resolution
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
@@ -184,7 +197,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         full_norm = cv2.resize(norm_uint8, (w_img, h_img))
         
         # STANDARD JET: Low (0) = Blue, High (255) = Red
-        # This matches "Red places are the most stretched"
         color_map = cv2.applyColorMap(full_norm, cv2.COLORMAP_JET)
         
         # Overlay
@@ -249,7 +261,7 @@ if image_file is not None:
             
             with col1:
                 st.subheader("Stress Heatmap")
-                st.image(result_img, channels="RGB", use_container_width=True)
+                st.image(result_img, channels="BGR", use_container_width=True)
             
             with col2:
                 st.subheader("Analysis Log")
