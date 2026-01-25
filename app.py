@@ -228,7 +228,7 @@ if image_file is not None:
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Stress Heatmap")
-                st.image(result_img, channels="RGB", use_container_width=True)
+                st.image(result_img, channels="BGR", use_container_width=True)
             
             with col2:
                 st.subheader("Data")
