@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (RED SQUARE + SYMMETRIC COLORS)
+# 2. ANALYSIS LOGIC (STANDARD JET TOPOGRAPHY)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
                        blur_val, thresh_block, min_area, manual_spacing):
@@ -65,12 +65,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     ref_box = (0,0,0,0)
     
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    # Red Range (0-10 and 170-180)
-    lower_red1 = np.array([0, 70, 50])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 70, 50])
-    upper_red2 = np.array([180, 255, 255])
+    lower_red1 = np.array([0, 70, 50]); upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 70, 50]); upper_red2 = np.array([180, 255, 255])
     
     red_mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
     red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
@@ -86,7 +82,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             logs.append(f"**CALIBRATION (COLOR):** Found Red Square. Size = {ref_size_px}px")
             cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3) 
     
-    # Fallback: Black Square Shape Detection
+    # Fallback: Black Square Shape
     if ref_size_px is None:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray_macro = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -125,8 +121,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     contours_micro, _ = cv2.findContours(binary_micro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     dots = []
-    
-    # Safe Zone
     ex_margin = ref_size_px * 0.8
     rx, ry, rw, rh = ref_box
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
@@ -174,21 +168,19 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
-        
-        # SIGNED STRAIN (Keeps +/-)
+        # Signed Strain
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
         
         px, py = points[i]
         heatmap_data.append([px, py, strain])
         
-        # Max Tension Search
         if strain > max_strain_val:
             if (px > border_x) and (px < (w - border_x)) and (py > border_y) and (py < (h - border_y)):
                 max_strain_val = strain
                 target_idx = i
 
-        cv2.circle(output, (int(px), int(py)), 2, (0, 255, 0), -1)
+        cv2.circle(output, (int(px), int(py)), 2, (0, 0, 0), -1)
 
     # --- Physics Detail ---
     sig_x_disp = 0.0
@@ -206,7 +198,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         sig_y_disp = sy
         logs.append(f"**Peak Tension:** {sx:.2f} MPa (X)")
 
-    # --- Heatmap Generation (SYMMETRIC COLORS) ---
+    # --- Heatmap Generation (STANDARD TOPOGRAPHIC JET) ---
     if heatmap_data:
         h_img, w_img = img.shape[:2]
         pts = np.float32([p[:2] for p in heatmap_data])
@@ -216,41 +208,30 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
-        # 1. Find Symmetric Limit (e.g. +/- 20%)
-        # This ensures 0 is exactly in the middle of the color scale
+        # --- SYMMETRIC SCALING (Blue = Squeeze, Green = Neutral, Red = Stretch) ---
         limit = max(abs(np.min(grid_z)), abs(np.max(grid_z)))
         if limit < 0.01: limit = 0.01
         
-        # 2. Normalize -Limit to +Limit -> 0 to 255
-        # -Limit (Blue) -> 0
-        # 0 (Neutral)   -> 127
-        # +Limit (Red)  -> 255
+        # Map: -Limit -> 0 (Blue), 0 -> 127 (Green), +Limit -> 255 (Red)
         norm_map = (grid_z + limit) / (2 * limit)
         norm_map = np.clip(norm_map, 0, 1)
         norm_uint8 = (norm_map * 255).astype('uint8').T
         full_norm = cv2.resize(norm_uint8, (w_img, h_img))
         
-        # 3. Apply Jet Colormap (Blue=Low, Red=High)
+        # Apply JET (Standard Topographic)
         color_map = cv2.applyColorMap(full_norm, cv2.COLORMAP_JET)
         
-        # 4. Transparency Mask
-        # Hide areas with very low strain (Neutral zone) to avoid "Green" background
-        # We calculate magnitude to create the mask
-        mag_map = np.abs(grid_z)
-        mask_norm = np.clip(mag_map / (limit * 0.15), 0, 1) # Threshold at 15% of max
-        mask_uint8 = (mask_norm * 255).astype('uint8').T
-        full_mask = cv2.resize(mask_uint8, (w_img, h_img))
+        # Overlay Logic
+        # We blend heavily (0.7 color) so the white paper doesn't wash out the map
+        mask = np.abs(grid_z) > (limit * 0.05) # Show map where strain exists (>5%)
+        mask_3ch = np.dstack([mask]*3)
         
-        # Apply mask
-        mask_bool = full_mask > 50 
-        mask_3ch = np.dstack([mask_bool]*3)
-        output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, output, 0.3, 0), output)
+        # Darken background where map is applied to make colors "pop"
+        dark_bg = cv2.addWeighted(output, 0.4, np.zeros_like(output), 0.6, 0)
+        output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, dark_bg, 0.3, 0), output)
         
         # Mask Reference Area
-        mask_overlay = output.copy()
-        cv2.rectangle(mask_overlay, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
-        output = cv2.addWeighted(mask_overlay, 0.8, output, 0.2, 0)
-        
+        cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
         if ref_box != (0,0,0,0):
              cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
 
