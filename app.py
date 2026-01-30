@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (STANDARD JET TOPOGRAPHY)
+# 2. ANALYSIS LOGIC (FIXED MASK RESIZING)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
                        blur_val, thresh_block, min_area, manual_spacing):
@@ -198,7 +198,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         sig_y_disp = sy
         logs.append(f"**Peak Tension:** {sx:.2f} MPa (X)")
 
-    # --- Heatmap Generation (STANDARD TOPOGRAPHIC JET) ---
+    # --- Heatmap Generation (FIXED SIZE MATCHING) ---
     if heatmap_data:
         h_img, w_img = img.shape[:2]
         pts = np.float32([p[:2] for p in heatmap_data])
@@ -208,26 +208,33 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
-        # --- SYMMETRIC SCALING (Blue = Squeeze, Green = Neutral, Red = Stretch) ---
-        limit = max(abs(np.min(grid_z)), abs(np.max(grid_z)))
+        # --- 1. PREPARE THE FULL SIZE MAP FIRST ---
+        # The grid is 1/4th size, we must resize it to Full Image Size
+        # BEFORE we calculate masks, so everything matches 'output' shape.
+        full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) # Note the .T transpose
+
+        # --- 2. CALCULATE LIMITS & NORMALIZATION ---
+        limit = max(abs(np.min(full_grid_z)), abs(np.max(full_grid_z)))
         if limit < 0.01: limit = 0.01
         
-        # Map: -Limit -> 0 (Blue), 0 -> 127 (Green), +Limit -> 255 (Red)
-        norm_map = (grid_z + limit) / (2 * limit)
+        # Normalize -Limit to +Limit -> 0 to 255
+        norm_map = (full_grid_z + limit) / (2 * limit)
         norm_map = np.clip(norm_map, 0, 1)
-        norm_uint8 = (norm_map * 255).astype('uint8').T
-        full_norm = cv2.resize(norm_uint8, (w_img, h_img))
+        full_norm_uint8 = (norm_map * 255).astype('uint8')
         
-        # Apply JET (Standard Topographic)
-        color_map = cv2.applyColorMap(full_norm, cv2.COLORMAP_JET)
+        # --- 3. APPLY COLORMAP ---
+        color_map = cv2.applyColorMap(full_norm_uint8, cv2.COLORMAP_JET)
         
-        # Overlay Logic
-        # We blend heavily (0.7 color) so the white paper doesn't wash out the map
-        mask = np.abs(grid_z) > (limit * 0.05) # Show map where strain exists (>5%)
-        mask_3ch = np.dstack([mask]*3)
+        # --- 4. CREATE MASK (Now using the same Full Size Grid) ---
+        # Show map where strain > 5% of max
+        mask_bool = np.abs(full_grid_z) > (limit * 0.05)
+        mask_3ch = np.dstack([mask_bool]*3)
         
+        # --- 5. BLEND ---
         # Darken background where map is applied to make colors "pop"
         dark_bg = cv2.addWeighted(output, 0.4, np.zeros_like(output), 0.6, 0)
+        
+        # Now output, mask_3ch, color_map, and dark_bg are ALL (h, w, 3). No crash.
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, dark_bg, 0.3, 0), output)
         
         # Mask Reference Area
