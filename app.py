@@ -40,13 +40,14 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (BGR + REF MASKING)
+# 2. ANALYSIS LOGIC (WITH TUNING)
 # ==========================================
-def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
+def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
+                       blur_val, thresh_block, min_area, manual_spacing):
     logs = []
     
     image_np = np.array(image.convert('RGB'))
-    img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR) # Working in BGR
+    img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     
     # Resize Logic
     h, w = img.shape[:2]
@@ -59,10 +60,15 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     output = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # --- Preprocessing ---
-    blurred = cv2.medianBlur(gray, 3) 
+    # --- USER TUNED PREPROCESSING ---
+    # Ensure blur is odd
+    if blur_val % 2 == 0: blur_val += 1
+    blurred = cv2.medianBlur(gray, blur_val) 
+    
+    # Ensure threshold block is odd
+    if thresh_block % 2 == 0: thresh_block += 1
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 11, 2)
+                                   cv2.THRESH_BINARY_INV, thresh_block, 2)
     
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -81,20 +87,31 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         
         if len(approx) == 4: 
             x, y, w_rect, h_rect = cv2.boundingRect(cnt)
-            ref_size_px = w_rect
-            ref_box = (x, y, w_rect, h_rect)
-            logs.append(f"**CALIBRATION:** Found Square. 1 Unit = {ref_size_px}px")
-            break 
+            # Aspect ratio check to ensure it's roughly square (0.8 to 1.2)
+            aspect = float(w_rect)/h_rect
+            if 0.8 < aspect < 1.2:
+                ref_size_px = w_rect
+                ref_box = (x, y, w_rect, h_rect)
+                logs.append(f"**CALIBRATION:** Found Square. 1 Unit = {ref_size_px}px")
+                cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (255, 0, 0), 2)
+                break 
 
+    # Fallback to Manual Spacing if Square fails
     if ref_size_px is None:
-        return output, logs + ["ERROR: Reference Square not found."], binary
+        if manual_spacing > 0:
+            ref_size_px = manual_spacing
+            # Fake box for exclusion logic
+            ref_box = (0,0,0,0) 
+            logs.append(f"**CALIBRATION:** Square not found. Using Manual Spacing: {ref_size_px}px")
+        else:
+            return output, logs + ["ERROR: Reference Square not found AND Manual Spacing is 0."], binary
 
     # ======================================================
-    # PASS 2: FIND DOTS (With Exclusion Zone)
+    # PASS 2: FIND DOTS (With Tuning Filters)
     # ======================================================
     dots = []
     
-    # Safe Zone Calculation (for filtering dots)
+    # Exclusion Zone
     ex_margin = ref_size_px * 0.8
     rx, ry, rw, rh = ref_box
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
@@ -102,22 +119,26 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 5: continue 
-        if area > (ref_size_px * ref_size_px * 0.8): continue # Skip square
+        
+        # USER CONTROLLED FILTER
+        if area < min_area: continue 
+        
+        # Don't re-detect the big square
+        if area > (ref_size_px * ref_size_px * 0.8): continue
 
         M = cv2.moments(cnt)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
             
-            # If inside the exclusion box, skip it
+            # Exclusion Check
             if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
                 continue
             
             dots.append([cx, cy])
 
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Only found {len(dots)} valid dots."], binary
+        return output, logs + [f"ERROR: Only found {len(dots)} valid dots. Try lowering 'Min Dot Area' or adjusting Threshold."], binary
 
     # --- KD-Tree Processing ---
     points = np.array(dots)
@@ -130,7 +151,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
     max_strain_val = -999.0 
     target_idx = -1
     
-    # Edge Filter (10% border)
     border_x = w * 0.10 
     border_y = h * 0.10
     
@@ -147,7 +167,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         px, py = points[i]
         heatmap_data.append([px, py, strain_mag])
         
-        # Max Tension Logic (Ignoring borders)
         if strain > max_strain_val:
             if (px > border_x) and (px < (w - border_x)) and (py > border_y) and (py < (h - border_y)):
                 max_strain_val = strain
@@ -197,17 +216,14 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
         mask_3ch = np.dstack([mask]*3)
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, output, 0.3, 0), output)
         
-        # --- FIX: VISUAL MASKING OF REFERENCE AREA ---
-        # Draw a semi-transparent dark box over the reference area to hide the "bad look"
-        # We use a slightly larger box than the exclusion zone to be safe
+        # Masking Reference Area
         mask_overlay = output.copy()
         cv2.rectangle(mask_overlay, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
         output = cv2.addWeighted(mask_overlay, 0.8, output, 0.2, 0)
         
-        # Draw the Reference Square Outline on top for clarity
-        cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
-        cv2.putText(output, "REF", (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
-        
+        if ref_box is not None and ref_box != (0,0,0,0):
+             cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
+
         # Draw Label
         if target_idx != -1:
             mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
@@ -224,21 +240,33 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor):
             cv2.putText(output, label_y, (mx+5, my-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2)
             cv2.circle(output, (mx, my), 5, (255, 0, 255), 2)
 
-    # NO RGB CONVERSION HERE - Returning BGR for Streamlit
     return output, logs, binary
 
 # ==========================================
 # 3. STREAMLIT UI
 # ==========================================
-st.set_page_config(page_title="High Density Analyzer", layout="wide")
-st.title("🔬 High Density Stress Analyzer")
+st.set_page_config(page_title="Universal Stress Analyzer", layout="wide")
+st.title("🔬 Universal Stress Analyzer")
 
 with st.sidebar:
-    st.header("Physics Parameters")
+    st.header("1. Detection Tuning")
+    st.info("Adjust these if you see 'Snow' or missing dots.")
+    
+    blur_val = st.slider("Blur Amount (Smooths Texture)", 1, 15, 7, step=2)
+    thresh_block = st.slider("Threshold Sensitivity", 3, 31, 15, step=2)
+    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 30)
+    
+    st.divider()
+    
+    st.header("2. Calibration")
+    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0)
+    
+    st.divider()
+    
+    st.header("3. Physics")
     modulus = st.number_input("Young's Modulus (MPa)", value=51.0)
     poisson = st.number_input("Poisson's Ratio", value=0.3)
     strain_factor = st.number_input("Calibration Factor", value=1.0)
-    st.info("Visual artifacts around REF are now masked.")
 
 image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
 
@@ -249,19 +277,20 @@ if image_file is not None:
             original_image = Image.open(image_file)
             
             result_img, logs, binary_view = analyze_dot_pattern(
-                original_image, modulus, poisson, strain_factor
+                original_image, modulus, poisson, strain_factor,
+                blur_val, thresh_block, min_area, manual_spacing
             )
             
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Stress Heatmap")
-                # HERE IS YOUR BGR CHANNEL REQUEST:
-                st.image(result_img, channels="RGB", use_container_width=True)
+                st.image(result_img, channels="BGR", use_container_width=True)
             
             with col2:
                 st.subheader("Data")
                 for line in logs:
                     st.markdown(line)
                 
-                with st.expander("Binary Mask"):
-                    st.image(binary_view, caption="Detected Dots", use_container_width=True)
+                with st.expander("Binary Mask (Detection Check)", expanded=True):
+                    st.image(binary_view, caption="White = Detected Dot", use_container_width=True)
+                    st.caption("If this looks like static/snow, INCREASE 'Min Dot Area' or 'Blur'.")
