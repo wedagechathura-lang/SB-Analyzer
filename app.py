@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (COLOR + GEOMETRY)
+# 2. ANALYSIS LOGIC (RED SQUARE + SYMMETRIC COLORS)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
                        blur_val, thresh_block, min_area, manual_spacing):
@@ -64,26 +64,19 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     ref_size_px = None 
     ref_box = (0,0,0,0)
     
-    # Convert to HSV to detect color
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # Red has two ranges in HSV (0-10 and 170-180)
+    # Red Range (0-10 and 170-180)
     lower_red1 = np.array([0, 70, 50])
     upper_red1 = np.array([10, 255, 255])
     lower_red2 = np.array([170, 70, 50])
     upper_red2 = np.array([180, 255, 255])
     
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    red_mask = mask1 + mask2
-    
-    # Clean up the mask
-    kernel = np.ones((5,5), np.uint8)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+    red_mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
     
     contours_red, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # If we found red blobs, pick the biggest one
     if contours_red:
         largest_red = max(contours_red, key=cv2.contourArea)
         if cv2.contourArea(largest_red) > 100:
@@ -91,11 +84,9 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             ref_size_px = w_rect
             ref_box = (x, y, w_rect, h_rect)
             logs.append(f"**CALIBRATION (COLOR):** Found Red Square. Size = {ref_size_px}px")
-            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3) # Draw Green Box on Red
+            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3) 
     
-    # ======================================================
-    # PASS 1.5: FALLBACK TO BLACK SQUARE (If no red found)
-    # ======================================================
+    # Fallback: Black Square Shape Detection
     if ref_size_px is None:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray_macro = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -114,21 +105,19 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
                     logs.append(f"**CALIBRATION (SHAPE):** Found Black Square. Size = {ref_size_px}px")
                     break
 
-    # Manual Spacing Override
     if ref_size_px is None:
         if manual_spacing > 0:
             ref_size_px = manual_spacing
             logs.append(f"**CALIBRATION:** Using Manual Spacing: {ref_size_px}px")
         else:
-            return output, logs + ["ERROR: Reference Square not found (Red or Black). Check lighting."], red_mask
+            return output, logs + ["ERROR: Reference Square not found. Check lighting."], red_mask
 
     # ======================================================
-    # PASS 2: FIND DOTS (Adaptive Threshold)
+    # PASS 2: FIND DOTS
     # ======================================================
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_val % 2 == 0: blur_val += 1
     blurred = cv2.medianBlur(gray, blur_val) 
-    
     if thresh_block % 2 == 0: thresh_block += 1
     binary_micro = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, thresh_block, 2)
@@ -137,7 +126,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     dots = []
     
-    # Safe Zone around Reference
+    # Safe Zone
     ex_margin = ref_size_px * 0.8
     rx, ry, rw, rh = ref_box
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
@@ -146,23 +135,18 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     for cnt in contours_micro:
         area = cv2.contourArea(cnt)
         if area < min_area: continue 
-        
-        # Ignore the big square itself
         if area > (ref_size_px * ref_size_px * 0.5): continue
 
         M = cv2.moments(cnt)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            
-            # Exclusion Check
             if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
                 continue
-            
             dots.append([cx, cy])
 
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Found {len(dots)} dots. Adjust sliders."], binary_micro
+        return output, logs + [f"ERROR: Only {len(dots)} dots found."], binary_micro
 
     # --- KD-Tree Processing ---
     points = np.array(dots)
@@ -171,20 +155,17 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     heatmap_data = [] 
     
-    # Baseline Logic
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
     
     baseline_dist = ref_size_px 
-    if manual_spacing > 0:
-         baseline_dist = manual_spacing
+    if manual_spacing > 0: baseline_dist = manual_spacing
          
     logs.append(f"**Baseline:** {baseline_dist:.1f}px (Median Dot Dist: {median_spacing:.1f}px)")
     
     max_valid_dist = baseline_dist * 3.0
     max_strain_val = -999.0 
     target_idx = -1
-    
     border_x = w * 0.10 
     border_y = h * 0.10
     
@@ -193,13 +174,15 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
+        
+        # SIGNED STRAIN (Keeps +/-)
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
-        strain_mag = abs(strain)
         
         px, py = points[i]
-        heatmap_data.append([px, py, strain_mag])
+        heatmap_data.append([px, py, strain])
         
+        # Max Tension Search
         if strain > max_strain_val:
             if (px > border_x) and (px < (w - border_x)) and (py > border_y) and (py < (h - border_y)):
                 max_strain_val = strain
@@ -223,7 +206,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         sig_y_disp = sy
         logs.append(f"**Peak Tension:** {sx:.2f} MPa (X)")
 
-    # --- Heatmap Generation ---
+    # --- Heatmap Generation (SYMMETRIC COLORS) ---
     if heatmap_data:
         h_img, w_img = img.shape[:2]
         pts = np.float32([p[:2] for p in heatmap_data])
@@ -233,19 +216,34 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
-        peak_strain = np.percentile(vals, 99) 
-        if peak_strain < 0.01: peak_strain = 0.01 
+        # 1. Find Symmetric Limit (e.g. +/- 20%)
+        # This ensures 0 is exactly in the middle of the color scale
+        limit = max(abs(np.min(grid_z)), abs(np.max(grid_z)))
+        if limit < 0.01: limit = 0.01
         
-        norm_map = np.clip(grid_z / peak_strain, 0, 1)
-        norm_map = np.power(norm_map, 0.6) 
-        
+        # 2. Normalize -Limit to +Limit -> 0 to 255
+        # -Limit (Blue) -> 0
+        # 0 (Neutral)   -> 127
+        # +Limit (Red)  -> 255
+        norm_map = (grid_z + limit) / (2 * limit)
+        norm_map = np.clip(norm_map, 0, 1)
         norm_uint8 = (norm_map * 255).astype('uint8').T
         full_norm = cv2.resize(norm_uint8, (w_img, h_img))
         
+        # 3. Apply Jet Colormap (Blue=Low, Red=High)
         color_map = cv2.applyColorMap(full_norm, cv2.COLORMAP_JET)
         
-        mask = full_norm > 15 
-        mask_3ch = np.dstack([mask]*3)
+        # 4. Transparency Mask
+        # Hide areas with very low strain (Neutral zone) to avoid "Green" background
+        # We calculate magnitude to create the mask
+        mag_map = np.abs(grid_z)
+        mask_norm = np.clip(mag_map / (limit * 0.15), 0, 1) # Threshold at 15% of max
+        mask_uint8 = (mask_norm * 255).astype('uint8').T
+        full_mask = cv2.resize(mask_uint8, (w_img, h_img))
+        
+        # Apply mask
+        mask_bool = full_mask > 50 
+        mask_3ch = np.dstack([mask_bool]*3)
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.7, output, 0.3, 0), output)
         
         # Mask Reference Area
@@ -315,5 +313,5 @@ if image_file is not None:
             with col2:
                 st.subheader("Data")
                 for line in logs: st.markdown(line)
-                with st.expander("Binary Mask (Dots)"):
+                with st.expander("Binary Mask"):
                     st.image(binary_view, caption="Detected Dots", use_container_width=True)
