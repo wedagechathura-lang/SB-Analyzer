@@ -40,7 +40,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     return sigma_x, sigma_y
 
 # ==========================================
-# 2. ANALYSIS LOGIC (DOUBLE-SCAN)
+# 2. ANALYSIS LOGIC (COLOR + GEOMETRY)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
                        blur_val, thresh_block, min_area, manual_spacing):
@@ -57,59 +57,75 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         h, w = img.shape[:2]
 
     output = img.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
     # ======================================================
-    # PASS 1: THE "MACRO" EYE (Find Reference Square)
-    # Uses Otsu thresholding which is better for solid objects
+    # PASS 1: FIND RED REFERENCE SQUARE (COLOR DETECTION)
     # ======================================================
     ref_size_px = None 
     ref_box = (0,0,0,0)
     
-    # Heavy blur to merge square details
-    gray_macro = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Otsu's Threshold (Global, not Adaptive) -> Good for big solid shapes
-    _, binary_macro = cv2.threshold(gray_macro, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Convert to HSV to detect color
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    contours_macro, _ = cv2.findContours(binary_macro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # Sort largest first
-    contours_macro = sorted(contours_macro, key=cv2.contourArea, reverse=True)
+    # Red has two ranges in HSV (0-10 and 170-180)
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
     
-    for cnt in contours_macro:
-        area = cv2.contourArea(cnt)
-        if area < 100: continue # Too small to be the square
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = mask1 + mask2
+    
+    # Clean up the mask
+    kernel = np.ones((5,5), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+    
+    contours_red, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # If we found red blobs, pick the biggest one
+    if contours_red:
+        largest_red = max(contours_red, key=cv2.contourArea)
+        if cv2.contourArea(largest_red) > 100:
+            x, y, w_rect, h_rect = cv2.boundingRect(largest_red)
+            ref_size_px = w_rect
+            ref_box = (x, y, w_rect, h_rect)
+            logs.append(f"**CALIBRATION (COLOR):** Found Red Square. Size = {ref_size_px}px")
+            cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3) # Draw Green Box on Red
+    
+    # ======================================================
+    # PASS 1.5: FALLBACK TO BLACK SQUARE (If no red found)
+    # ======================================================
+    if ref_size_px is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray_macro = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, binary_macro = cv2.threshold(gray_macro, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        contours_macro, _ = cv2.findContours(binary_macro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        perimeter = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
-        
-        # Square Check: 4 corners
-        if len(approx) == 4: 
-            x, y, w_rect, h_rect = cv2.boundingRect(cnt)
-            aspect = float(w_rect)/h_rect
-            
-            # Aspect ratio check (0.7 - 1.3 allow for rotation/tilt)
-            if 0.7 < aspect < 1.3:
-                ref_size_px = w_rect
-                ref_box = (x, y, w_rect, h_rect)
-                logs.append(f"**CALIBRATION:** Found Square. 1 Unit = {ref_size_px}px")
-                
-                # Draw visual confirmation
-                cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (255, 0, 0), 3)
-                cv2.putText(output, "REF", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,0,0), 2)
-                break 
+        for cnt in contours_macro:
+            area = cv2.contourArea(cnt)
+            if area < 100: continue
+            approx = cv2.approxPolyDP(cnt, 0.04 * cv2.arcLength(cnt, True), True)
+            if len(approx) == 4:
+                x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+                if 0.7 < float(w_rect)/h_rect < 1.3:
+                    ref_size_px = w_rect
+                    ref_box = (x, y, w_rect, h_rect)
+                    logs.append(f"**CALIBRATION (SHAPE):** Found Black Square. Size = {ref_size_px}px")
+                    break
 
-    # Fallback to Manual Spacing if Square is truly gone
+    # Manual Spacing Override
     if ref_size_px is None:
         if manual_spacing > 0:
             ref_size_px = manual_spacing
-            logs.append(f"**CALIBRATION:** Square not found. Using Manual Spacing: {ref_size_px}px")
+            logs.append(f"**CALIBRATION:** Using Manual Spacing: {ref_size_px}px")
         else:
-            return output, logs + ["ERROR: Reference Square not found. Ensure it is dark and distinct."], binary_macro
+            return output, logs + ["ERROR: Reference Square not found (Red or Black). Check lighting."], red_mask
 
     # ======================================================
-    # PASS 2: THE "MICRO" EYE (Find Dots)
-    # Uses Adaptive Thresholding (User Tuned)
+    # PASS 2: FIND DOTS (Adaptive Threshold)
     # ======================================================
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_val % 2 == 0: blur_val += 1
     blurred = cv2.medianBlur(gray, blur_val) 
     
@@ -121,7 +137,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     dots = []
     
-    # Calculate Exclusion Zone (Around the detected square)
+    # Safe Zone around Reference
     ex_margin = ref_size_px * 0.8
     rx, ry, rw, rh = ref_box
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
@@ -131,8 +147,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         area = cv2.contourArea(cnt)
         if area < min_area: continue 
         
-        # Don't re-detect the reference square contour itself
-        # (It will also appear in the micro scan, but huge)
+        # Ignore the big square itself
         if area > (ref_size_px * ref_size_px * 0.5): continue
 
         M = cv2.moments(cnt)
@@ -140,8 +155,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
             
-            # --- EXCLUSION CHECK ---
-            # If the dot is inside the "Reference Zone", ignore it
+            # Exclusion Check
             if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
                 continue
             
@@ -157,7 +171,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     heatmap_data = [] 
     
-    # Smart Spacing Logic
+    # Baseline Logic
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
     
@@ -239,7 +253,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         cv2.rectangle(mask_overlay, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
         output = cv2.addWeighted(mask_overlay, 0.8, output, 0.2, 0)
         
-        # Re-draw the Square (so it's visible on top of the mask)
         if ref_box != (0,0,0,0):
              cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
 
@@ -259,7 +272,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             cv2.putText(output, label_y, (mx+5, my-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2)
             cv2.circle(output, (mx, my), 5, (255, 0, 255), 2)
 
-    return output, logs, binary_micro # Return the micro mask for user to debug
+    return output, logs, binary_micro 
 
 # ==========================================
 # 3. STREAMLIT UI
@@ -271,21 +284,15 @@ with st.sidebar:
     st.header("1. Detection Tuning")
     st.info("Adjust these if you see 'Snow' or missing dots.")
     
-    blur_val = st.slider("Blur Amount (Smooths Texture)", 1, 15, 9, step=2)
+    blur_val = st.slider("Blur Amount", 1, 15, 9, step=2)
     thresh_block = st.slider("Threshold Sensitivity", 3, 31, 17, step=2)
-    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5) # Default lowered to 5
+    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5)
     
     st.divider()
-    
     st.header("2. Calibration")
-    manual_spacing = st.number_input(
-        "Manual Spacing Override (px)", 
-        value=0.0,
-        help="Use this if your dots are much smaller/closer than the Reference Square."
-    )
+    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0)
     
     st.divider()
-    
     st.header("3. Physics")
     modulus = st.number_input("Young's Modulus (MPa)", value=51.0)
     poisson = st.number_input("Poisson's Ratio", value=0.3)
@@ -296,24 +303,17 @@ image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
 if image_file is not None:
     if st.button("RUN ANALYSIS", type="primary"):
         with st.spinner("Processing..."):
-            
             original_image = Image.open(image_file)
-            
             result_img, logs, binary_view = analyze_dot_pattern(
                 original_image, modulus, poisson, strain_factor,
                 blur_val, thresh_block, min_area, manual_spacing
             )
-            
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Stress Heatmap")
                 st.image(result_img, channels="BGR", use_container_width=True)
-            
             with col2:
                 st.subheader("Data")
-                for line in logs:
-                    st.markdown(line)
-                
-                with st.expander("Binary Mask (Detection Check)", expanded=True):
-                    st.image(binary_view, caption="White = Detected Dot", use_container_width=True)
-                    st.caption("If this looks like static/snow, INCREASE 'Min Dot Area' or 'Blur'.")
+                for line in logs: st.markdown(line)
+                with st.expander("Binary Mask (Dots)"):
+                    st.image(binary_view, caption="Detected Dots", use_container_width=True)
