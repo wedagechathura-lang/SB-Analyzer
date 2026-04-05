@@ -159,11 +159,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     logs.append(f"**Baseline:** {baseline_dist:.1f}px (Median Dot Dist: {median_spacing:.1f}px)")
     
     max_valid_dist = baseline_dist * 3.0
-    max_strain_val = -999.0 
-    target_idx = -1
-    border_x = w * 0.10 
-    border_y = h * 0.10
     
+    # --- loop to generate heatmap data only ---
     for i, d_list in enumerate(dist):
         neighbors = d_list[1:]
         if np.max(neighbors) > max_valid_dist: continue
@@ -176,28 +173,32 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         px, py = points[i]
         heatmap_data.append([px, py, strain])
         
-        if strain > max_strain_val:
-            if (px > border_x) and (px < (w - border_x)) and (py > border_y) and (py < (h - border_y)):
-                max_strain_val = strain
-                target_idx = i
-
         cv2.circle(output, (int(px), int(py)), 2, (0, 0, 0), -1)
 
-    # --- Physics Detail ---
+    # ==========================================
+    # MODIFICATION: FIND IMAGE MID POINT
+    # ==========================================
     sig_x_disp = 0.0
     sig_y_disp = 0.0
-    hotspot_loc = (0,0)
-
-    if target_idx != -1:
-        n_indices = indices[target_idx, 1:]
-        center_pt = points[target_idx]
-        hotspot_loc = center_pt
-        
-        sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
-                                        modulus_mpa, poisson_ratio, strain_factor)
-        sig_x_disp = sx
-        sig_y_disp = sy
-        logs.append(f"**Peak Tension:** {sx:.2f} MPa (X)")
+    
+    # Absolute geometric center of the (potentially scaled) image
+    img_center = np.array([w / 2, h / 2])
+    
+    # query tree for the dot closest to absolute center (k=1)
+    center_dist, target_idx = tree.query(img_center, k=1)
+    
+    hotspot_loc = points[target_idx]
+    n_indices = indices[target_idx, 1:]
+    center_pt = points[target_idx]
+    
+    # Calculate stress for center dot
+    sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
+                                    modulus_mpa, poisson_ratio, strain_factor)
+    sig_x_disp = sx
+    sig_y_disp = sy
+    
+    logs.append(f"**Analysis Point:** Geometric Center (closest dot at {hotspot_loc})")
+    logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
     if heatmap_data:
@@ -210,35 +211,28 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
-        # --- RESIZE GRID TO MATCH IMAGE EXACTLY ---
-        # Note: griddata returns shape (width_grid, height_grid). We transpose to get (height, width).
+        # Transpose to get (height, width) for OpenCV
         full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) 
         
         # --- SYMMETRIC SCALING (Blue=Neg, Red=Pos) ---
         limit = max(abs(np.min(full_grid_z)), abs(np.max(full_grid_z)))
         if limit < 0.01: limit = 0.01
         
-        # Normalization: 0 = Blue, 127 = Green (Zero), 255 = Red
         norm_map = (full_grid_z + limit) / (2 * limit)
         norm_map = np.clip(norm_map, 0, 1)
         full_norm_uint8 = (norm_map * 255).astype('uint8')
         
-        # Apply JET (Standard Topographic)
+        # Apply topographic JET map
         color_map = cv2.applyColorMap(full_norm_uint8, cv2.COLORMAP_JET)
         
         # --- AREA MASK (CONVEX HULL) ---
-        # Instead of masking by value (which makes white gaps), 
-        # we mask by the SHAPE of the dots.
         hull_mask = np.zeros((h_img, w_img), dtype=np.uint8)
         hull_pts = cv2.convexHull(np.array(dots).astype(np.int32))
         cv2.fillPoly(hull_mask, [hull_pts], 255)
         
-        # Create 3-channel mask
         mask_3ch = np.dstack([hull_mask]*3) > 128
         
-        # --- BLEND ---
-        # Blend uniformly everywhere inside the Hull
-        # 60% Color Map + 40% Original Image
+        # --- BLEND (60% Color + 40% Original) ---
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.6, output, 0.4, 0), output)
         
         # Mask Reference Area
@@ -246,21 +240,27 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if ref_box != (0,0,0,0):
              cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
 
-        # Draw Label
-        if target_idx != -1:
-            mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
-            label_x = f"Sx: {sig_x_disp:.2f} MPa"
-            label_y = f"Sy: {sig_y_disp:.2f} MPa"
-            
-            cv2.rectangle(output, (mx, my - 60), (mx + 220, my + 10), (255, 255, 255), -1)
-            cv2.rectangle(output, (mx, my - 60), (mx + 220, my + 10), (0, 0, 0), 2)
-            
-            col_x = (0, 0, 255) if sig_x_disp > 0 else (255, 0, 0)
-            col_y = (0, 0, 255) if sig_y_disp > 0 else (255, 0, 0)
-            
-            cv2.putText(output, label_x, (mx+5, my-35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_x, 2)
-            cv2.putText(output, label_y, (mx+5, my-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2)
-            cv2.circle(output, (mx, my), 5, (255, 0, 255), 2)
+        # Draw Label for Mid Point stress
+        mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
+        label_x = f"Sx: {sig_x_disp:.2f} MPa"
+        label_y = f"Sy: {sig_y_disp:.2f} MPa"
+        
+        # Updated text for Label Box
+        header = "Center Stress"
+        
+        cv2.rectangle(output, (mx, my - 75), (mx + 220, my + 10), (255, 255, 255), -1)
+        cv2.rectangle(output, (mx, my - 75), (mx + 220, my + 10), (0, 0, 0), 2)
+        
+        col_x = (0, 0, 255) if sig_x_disp > 0 else (255, 0, 0)
+        col_y = (0, 0, 255) if sig_y_disp > 0 else (255, 0, 0)
+        
+        # Draw header and values
+        cv2.putText(output, header, (mx+5, my-55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
+        cv2.putText(output, label_x, (mx+5, my-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_x, 2, cv2.LINE_AA)
+        cv2.putText(output, label_y, (mx+5, my-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2, cv2.LINE_AA)
+        
+        # Highlight center point with magenta circle
+        cv2.circle(output, (mx, my), 5, (255, 0, 255), 2, cv2.LINE_AA)
 
     return output, logs, binary_micro 
 
@@ -300,10 +300,10 @@ if image_file is not None:
             )
             col1, col2 = st.columns([2, 1])
             with col1:
-                st.subheader("Stress Heatmap")
+                st.subheader("Stress Topography heat map")
                 st.image(result_img, channels="BGR", use_container_width=True)
             with col2:
-                st.subheader("Data")
+                st.subheader("Analysis Data")
                 for line in logs: st.markdown(line)
-                with st.expander("Binary Mask"):
+                with st.expander("Binary Dot Mask"):
                     st.image(binary_view, caption="Detected Dots", use_container_width=True)
