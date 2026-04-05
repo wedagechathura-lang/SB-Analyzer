@@ -1,10 +1,3 @@
-Here is the modified code.
-I have updated the analyze_dot_pattern function to generate and return a dedicated verification image.
-In the user interface (the right column), I have removed the old single expander and replaced it with a **"Computer Vision Verification"** section containing two columns:
- 1. **Raw Adaptive Mask:** Shows the direct output of the thresholding algorithm. Useful for tuning blur and sensitivity sliders to remove noise ("snow") or thicken dots.
- 2. **Dots Detected:** Shows the original image with **Green overlay circles** on dots successfully detected and accepted by the software, and **Blue overlay contours** on candidates that were rejected (due to area size or being inside the reference square safe zone).
-This allows you to know exactly how the software is interpreting the image.
-```python
 import streamlit as st
 import cv2
 import numpy as np
@@ -361,5 +354,3 @@ if image_file is not None:
                     with st.expander("2. Dots Detected", expanded=True):
                         # BGR image with overlays
                         st.image(dots_view, caption="Green Circles = Valid Dots", use_container_width=True, channels="BGR")
-
-```
