@@ -184,13 +184,11 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     # --- New Phase 1: Robust Outlier Removal (DBSCAN Clustering) ---
     # Fiber noise usually results in isolated clusters or long thin noise artifacts. 
     # Real dots are densely packed in a cluster with standardized spatial consensus.
-    # Eps: maximum distance between two samples for one to be considered as in the neighborhood of the other.
     # set Eps to roughly 2x the expected baseline to allow for stretch, but reject far noise.
-    # min_samples: The number of samples in a neighborhood for a point to be considered as a core point.
     db = DBSCAN(eps=baseline_dist * 2.0, min_samples=4).fit(raw_points)
     labels = db.labels_
     
-    # Find the main dense cluster (which will be the grid). In complex cases, we pick the largest cluster.
+    # Find the main dense cluster (picked by largest count)
     unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
     
     validated_dots = []
@@ -219,10 +217,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     final_points = np.array(clean_points_list)
 
     # --- New Phase 2: Missing Dot Imputation (KD-Tree Inpainting) ---
-    # Since it is a printed grid, we can identify "holes" in the pattern based on Hooke's Law local spacing expectation.
-    # Note: For real-time, we are using a simple imputation method. 
-    # A full grid-fitting RANSAC would be needed for robustness against rotation/perspective but is complex for Streamlit.
-    
+    # Hooke's Law requires neighbors. Boundary points or holes break the physics engine local expectation.
+    # Since it is a printed grid, we can deduce "holes" in the pattern based on neighborhood statistical properties.
     pattern_tree = cKDTree(final_points)
     dist, indices = pattern_tree.query(final_points, k=5) 
     
@@ -232,7 +228,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px (embedded physics input)")
 
     # Identify points with $<4$ immediate grid neighbors and synthesize the missing neighbor.
-    synth_tolerance = median_spacing * 0.3 # Tolerance for hole matching
     imputed_points = []
     
     # Analyze the geometry of the core cluster to find holes
@@ -248,20 +243,21 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         neighbor_vs = final_points[neighbors_idx] - current_pt
         mean_v = np.mean(neighbor_vs, axis=0)
         
+        # If clustered geometry found (meaning boundary/hole)
         if np.linalg.norm(mean_v) > median_spacing * 0.6:
-            # Clustered geometry. Missing neighbor is likely on the opposite side of the Mean_v
+            # We found a gap. Missing neighbor is likely on the opposite side of the clustered mean_v.
             potential_neighbor_v = -mean_v
             missing_neighbor = True
             
         if missing_neighbor:
             # We found a gap. Validate if the hole is real by checking if ANY final_point exists there.
-            # Ideal hole location: current + (ideal pitch vector). We use scaled mean_v as a proxy.
+            # Ideal hole location: current + (ideal pitch vector). We use mean_v as proxy.
             ideal_hole_loc = current_pt + potential_neighbor_v
             
             # Use kdtree to check if ANY point exists near this ideal hole
             hole_dist, _ = pattern_tree.query(ideal_hole_loc, k=1)
             
-            # Check against synthetic tolerance. Also don't add holes too close to existing dots or other synthesized holes
+            # Tolerance for hole matching
             if hole_dist > median_spacing * 1.5: # 1.5 means no dot exists roughly where one *should* be
                  # Found a hole! Synthesize the missing neighbor
                  new_p = ideal_hole_loc.astype(int)
@@ -434,6 +430,7 @@ if image_file is not None:
                 exp_col1, exp_col2 = st.columns(2)
                 with exp_col1:
                     with st.expander("1. Raw Candidate Mask", expanded=True):
+                        # adaptiveThreshold output (grayscale)
                         st.image(binary_view, caption="Shows all noise (grain/fibers)", use_container_width=True)
                 with exp_col2:
                     with st.expander("2. Valid Blobs Detected", expanded=True):
