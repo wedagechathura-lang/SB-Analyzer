@@ -265,15 +265,14 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
 
         # Draw Label for Mid Point stress as a simple tag
         mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
-        avg_stress = (sig_x_disp + sig_y_disp) / 2.0
-        label_text = f"Avg Stress: {avg_stress:.2f} MPa"
+        label_text = f"Center Stress: {sig_x_disp:.2f} MPa"
         
         # Determine color for entire tag: Tension is blue, compression is red.
-        col_tag = (0, 0, 255) if avg_stress > 0 else (255, 0, 0) 
+        col_tag = (0, 0, 255) if sig_x_disp > 0 else (255, 0, 0) 
         
         # New simplified white box for a single line
-        cv2.rectangle(output, (mx, my - 35), (mx + 220, my + 10), (255, 255, 255), -1)
-        cv2.rectangle(output, (mx, my - 35), (mx + 220, my + 10), (0, 0, 0), 2)
+        cv2.rectangle(output, (mx, my - 35), (mx + 260, my + 10), (255, 255, 255), -1)
+        cv2.rectangle(output, (mx, my - 35), (mx + 260, my + 10), (0, 0, 0), 2)
         
         # Single line text rendering
         cv2.putText(output, label_text, (mx+5, my-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_tag, 2, cv2.LINE_AA)
