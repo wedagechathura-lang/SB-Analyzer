@@ -23,6 +23,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
             
     if len(x_dists) > 0:
         avg_x = np.mean(x_dists)
+        # Using adjusted ref_size for strain calculation
         eps_x = ((avg_x - ref_size) / ref_size) * factor
     else: eps_x = 0.0
         
@@ -43,7 +44,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
 # 2. ANALYSIS LOGIC
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
-                       blur_val, thresh_block, min_area, manual_spacing):
+                       blur_val, thresh_block, min_area, manual_spacing, ref_adj_perc):
     logs = []
     
     image_np = np.array(image.convert('RGB'))
@@ -62,7 +63,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     # ======================================================
     # PASS 1: FIND RED REFERENCE SQUARE (COLOR DETECTION)
     # ======================================================
-    ref_size_px = None 
+    detected_ref_px = None 
     ref_box = (0,0,0,0)
     
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -78,13 +79,13 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         largest_red = max(contours_red, key=cv2.contourArea)
         if cv2.contourArea(largest_red) > 100:
             x, y, w_rect, h_rect = cv2.boundingRect(largest_red)
-            ref_size_px = w_rect
+            detected_ref_px = w_rect
             ref_box = (x, y, w_rect, h_rect)
-            logs.append(f"**CALIBRATION (COLOR):** Found Red Square. Size = {ref_size_px}px")
+            logs.append(f"**DETECTION:** Found Red Square: {detected_ref_px}px")
             cv2.rectangle(output, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3) 
     
     # Fallback: Black Square Shape
-    if ref_size_px is None:
+    if detected_ref_px is None:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray_macro = cv2.GaussianBlur(gray, (5, 5), 0)
         _, binary_macro = cv2.threshold(gray_macro, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -97,17 +98,30 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             if len(approx) == 4:
                 x, y, w_rect, h_rect = cv2.boundingRect(cnt)
                 if 0.7 < float(w_rect)/h_rect < 1.3:
-                    ref_size_px = w_rect
+                    detected_ref_px = w_rect
                     ref_box = (x, y, w_rect, h_rect)
-                    logs.append(f"**CALIBRATION (SHAPE):** Found Black Square. Size = {ref_size_px}px")
+                    logs.append(f"**DETECTION:** Found Black Square: {detected_ref_px}px")
                     break
 
-    if ref_size_px is None:
+    # Determine Base Reference Value
+    base_ref_px = detected_ref_px
+    if detected_ref_px is None:
         if manual_spacing > 0:
-            ref_size_px = manual_spacing
-            logs.append(f"**CALIBRATION:** Using Manual Spacing: {ref_size_px}px")
+            base_ref_px = manual_spacing
+            logs.append(f"**CALIBRATION:** Using Manual Spacing Overide: {base_ref_px}px")
         else:
-            return output, logs + ["ERROR: Reference Square not found. Check lighting."], red_mask
+            return output, logs + ["ERROR: Reference Square not found. Check lighting or use Manual Spacing."], red_mask
+    elif manual_spacing > 0:
+         base_ref_px = manual_spacing
+         logs.append(f"**CALIBRATION:** Overriding detected square with Manual Spacing: {base_ref_px}px")
+
+    # ==========================================
+    # MODIFICATION: APPLY SLIDER ADJUSTMENT
+    # ==========================================
+    # adjusted = base * (1 + adj/100) -> e.g. 100 * (1 + 5/100) = 105px
+    baseline_dist = base_ref_px * (1.0 + (ref_adj_perc / 100.0))
+    
+    logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px (Base: {base_ref_px}px, Adj: {ref_adj_perc:+.1f}%)")
 
     # ======================================================
     # PASS 2: FIND DOTS
@@ -122,7 +136,9 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     contours_micro, _ = cv2.findContours(binary_micro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     dots = []
-    ex_margin = ref_size_px * 0.8
+    # Use base detected size for masking, not adjusted size
+    mask_ref_size = base_ref_px if base_ref_px is not None else manual_spacing
+    ex_margin = mask_ref_size * 0.8
     rx, ry, rw, rh = ref_box
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
     safe_x2, safe_y2 = rx + rw + ex_margin, ry + rh + ex_margin
@@ -130,18 +146,21 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     for cnt in contours_micro:
         area = cv2.contourArea(cnt)
         if area < min_area: continue 
-        if area > (ref_size_px * ref_size_px * 0.5): continue
+        # Use adjusted baseline for max dot size filtering logic
+        if area > (baseline_dist * baseline_dist * 0.5): continue
 
         M = cv2.moments(cnt)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
-                continue
+            # Masking logic
+            if ref_box != (0,0,0,0):
+                if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
+                    continue
             dots.append([cx, cy])
 
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Only {len(dots)} dots found."], binary_micro
+        return output, logs + [f"ERROR: Only {len(dots)} dots found. Adjust Detection Tuning."], binary_micro
 
     # --- KD-Tree Processing ---
     points = np.array(dots)
@@ -152,11 +171,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
-    
-    baseline_dist = ref_size_px 
-    if manual_spacing > 0: baseline_dist = manual_spacing
          
-    logs.append(f"**Baseline:** {baseline_dist:.1f}px (Median Dot Dist: {median_spacing:.1f}px)")
+    logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px")
     
     max_valid_dist = baseline_dist * 3.0
     
@@ -166,7 +182,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
-        # Signed Strain
+        # Signed Strain using adjusted baseline
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
         
@@ -176,7 +192,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         cv2.circle(output, (int(px), int(py)), 2, (0, 0, 0), -1)
 
     # ==========================================
-    # MODIFICATION: FIND IMAGE MID POINT
+    # FIND IMAGE MID POINT STRESS
     # ==========================================
     sig_x_disp = 0.0
     sig_y_disp = 0.0
@@ -191,13 +207,13 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
-    # Calculate stress for center dot
+    # Calculate stress for center dot using adjusted baseline
     sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
                                     modulus_mpa, poisson_ratio, strain_factor)
     sig_x_disp = sx
     sig_y_disp = sy
     
-    logs.append(f"**Analysis Point:** Geometric Center (closest dot at {hotspot_loc})")
+    logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
     logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
@@ -235,9 +251,9 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         # --- BLEND (60% Color + 40% Original) ---
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.6, output, 0.4, 0), output)
         
-        # Mask Reference Area
-        cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
+        # Mask Reference Area visual
         if ref_box != (0,0,0,0):
+             cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
              cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
 
         # Draw Label for Mid Point stress
@@ -245,7 +261,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         label_x = f"Sx: {sig_x_disp:.2f} MPa"
         label_y = f"Sy: {sig_y_disp:.2f} MPa"
         
-        # Updated text for Label Box
         header = "Center Stress"
         
         cv2.rectangle(output, (mx, my - 75), (mx + 220, my + 10), (255, 255, 255), -1)
@@ -254,12 +269,10 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         col_x = (0, 0, 255) if sig_x_disp > 0 else (255, 0, 0)
         col_y = (0, 0, 255) if sig_y_disp > 0 else (255, 0, 0)
         
-        # Draw header and values
         cv2.putText(output, header, (mx+5, my-55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
         cv2.putText(output, label_x, (mx+5, my-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_x, 2, cv2.LINE_AA)
         cv2.putText(output, label_y, (mx+5, my-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_y, 2, cv2.LINE_AA)
         
-        # Highlight center point with magenta circle
         cv2.circle(output, (mx, my), 5, (255, 0, 255), 2, cv2.LINE_AA)
 
     return output, logs, binary_micro 
@@ -280,7 +293,19 @@ with st.sidebar:
     
     st.divider()
     st.header("2. Calibration")
-    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0)
+    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0, help="Manually set baseline pixel distance between dots, ignoring detected square.")
+    
+    # ==========================================
+    # MODIFICATION: ADD ADJUSTMENT SLIDER
+    # ==========================================
+    ref_adj_perc = st.slider(
+        "Fine-tune Reference Baseline (%)", 
+        min_value=-20.0, 
+        max_value=20.0, 
+        value=0.0, 
+        step=0.1,
+        help="Adjust the calculated resting dot distance. Positive increases resting length (shifting map towards compression), negative decreases it. Use to set specific map regions to zero stress."
+    )
     
     st.divider()
     st.header("3. Physics")
@@ -291,12 +316,14 @@ with st.sidebar:
 image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
 
 if image_file is not None:
+    # Key change here: pass the new slider value to the function
     if st.button("RUN ANALYSIS", type="primary"):
         with st.spinner("Processing..."):
             original_image = Image.open(image_file)
             result_img, logs, binary_view = analyze_dot_pattern(
                 original_image, modulus, poisson, strain_factor,
-                blur_val, thresh_block, min_area, manual_spacing
+                blur_val, thresh_block, min_area, manual_spacing,
+                ref_adj_perc # Passed to logic
             )
             col1, col2 = st.columns([2, 1])
             with col1:
