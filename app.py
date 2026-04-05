@@ -4,7 +4,6 @@ import numpy as np
 from PIL import Image
 from scipy.spatial import cKDTree
 from scipy.interpolate import griddata
-from sklearn.cluster import DBSCAN # NEW: for robust outlier removal
 
 # ==========================================
 # 1. PHYSICS MATH ENGINE
@@ -24,6 +23,7 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
             
     if len(x_dists) > 0:
         avg_x = np.mean(x_dists)
+        # Using adjusted ref_size for strain calculation
         eps_x = ((avg_x - ref_size) / ref_size) * factor
     else: eps_x = 0.0
         
@@ -110,6 +110,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             base_ref_px = manual_spacing
             logs.append(f"**CALIBRATION:** Using Manual Spacing Overide: {base_ref_px}px")
         else:
+            # We must return something for all return values on error
             return output, logs + ["ERROR: Reference Square not found. Check lighting or use Manual Spacing."], cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), img
     elif manual_spacing > 0:
          base_ref_px = manual_spacing
@@ -117,30 +118,20 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
 
     # MODIFICATION: APPLY SLIDER ADJUSTMENT
     baseline_dist = base_ref_px * (1.0 + (ref_adj_perc / 100.0))
-    logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px")
+    logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px (Base: {base_ref_px}px, Adj: {ref_adj_perc:+.1f}%)")
 
     # ======================================================
-    # PASS 2: FIND DOTS (REWRITTEN FOR ROBUSTNESS)
+    # PASS 2: FIND DOTS
     # ======================================================
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Illumination Correction (Existing, essential for shadows)
-    kernel_dim = max(9, int(h * 0.02))
-    if kernel_dim % 2 == 0: kernel_dim += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_dim, kernel_dim))
-    corrected_dots_bright = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    
-    # Standard Filtering (Keep user's high Blur: 11)
     if blur_val % 2 == 0: blur_val += 1
-    blurred = cv2.medianBlur(corrected_dots_bright, blur_val) 
-
-    # Binary Segmentation (Keep user's preferred high Sensitivity T: 3)
-    # This binary image will look VERY noisy/grainy in the background. Good.
+    blurred = cv2.medianBlur(gray, blur_val) 
     if thresh_block % 2 == 0: thresh_block += 1
     binary_micro = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY, thresh_block, 2)
+                                   cv2.THRESH_BINARY_INV, thresh_block, 2)
     
-    # Verification Image setup
+    # Create verification image to draw detected dots
+    # Copy original because BGR output blend clutters the final view
     verification_img = img.copy()
 
     contours_micro, _ = cv2.findContours(binary_micro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -172,149 +163,64 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
                     continue
             
             dots.append([cx, cy])
+            # Visualization modification: Draw green circles on correctly detected dots
+            cv2.circle(verification_img, (cx, cy), 3, (0, 255, 0), -1)
 
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Only {len(dots)} valid candidate blobs found. Adaptive thresholding window may be breaking locally. (Check Verification Expander)"], binary_micro, verification_img
+        return output, logs + [f"ERROR: Only {len(dots)} dots found. Adjust Detection Tuning."], binary_micro, verification_img
 
-    # ==========================================
-    # MODIFICATION PHASES START HERE
-    # ==========================================
-    raw_points = np.array(dots)
-    
-    # --- New Phase 1: Robust Outlier Removal (DBSCAN Clustering) ---
-    # Fiber noise usually results in isolated clusters or long thin noise artifacts. 
-    # Real dots are densely packed in a cluster with standardized spatial consensus.
-    # Eps: maximum distance between two samples for one to be considered as in the neighborhood of the other.
-    # set Eps to roughly 2x the expected baseline to allow for stretch, but reject far noise.
-    # min_samples: The number of samples in a neighborhood for a point to be considered as a core point.
-    db = DBSCAN(eps=baseline_dist * 2.0, min_samples=4).fit(raw_points)
-    labels = db.labels_
-    
-    # Find the main dense cluster (which will be the grid). In complex cases, we pick the largest cluster.
-    unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
-    
-    validated_dots = []
-    inpainted_dots = []
-
-    if len(unique_labels) == 0:
-        return output, logs + ["ERROR: Failed to find a coherent pattern cluster. Adaptive threshold likely created a noisy mess. Re-tune parameters."], binary_micro, verification_img
-        
-    main_cluster_label = unique_labels[np.argmax(counts)]
-    
-    # Extract points belonging to the main cluster and visualize outliers in red cross
-    clean_points_list = []
-    for i, p in enumerate(raw_points):
-        px, py = int(p[0]), int(p[1])
-        if labels[i] == main_cluster_label:
-            clean_points_list.append(p)
-            validated_dots.append(p)
-            # Visualization modification: Draw green circles on correctly detected AND pattern-passed dots
-            cv2.circle(verification_img, (px, py), 3, (0, 255, 0), -1)
-        elif labels[i] == -1:
-            # Visualize outliers officially rejected by pattern logic with red cross
-            cv2.drawMarker(verification_img, (px, py), (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
-
-    logs.append(f"**PATTERN CLEANING:** Retained {len(clean_points_list)} blobs (DBSCAN picked cluster with {np.max(counts)} points).")
-    
-    final_points = np.array(clean_points_list)
-
-    # --- New Phase 2: Missing Dot Imputation (KD-Tree Inpainting) ---
-    # Since it is a printed grid, we can identify "holes" in the pattern based on Hooke's Law local spacing expectation.
-    # Note: For real-time, we are using a simple imputation method. 
-    # A full grid-fitting RANSAC would be needed for robustness against rotation/perspective but is complex for Streamlit.
-    
-    pattern_tree = cKDTree(final_points)
-    dist, indices = pattern_tree.query(final_points, k=5) 
-    
-    all_neighbor_dists = dist[:, 1:].flatten()
-    median_spacing = np.median(all_neighbor_dists)
-    
-    logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px (embedded physics input)")
-
-    # Identify points with $<4$ immediate grid neighbors and synthesize the missing neighbor.
-    synth_tolerance = median_spacing * 0.3 # Tolerance for hole matching
-    imputed_points = []
-    
-    # Analyze the geometry of the core cluster to find holes
-    for i, d_list in enumerate(dist):
-        neighbors_idx = indices[i, 1:]
-        current_pt = final_points[i]
-        
-        # Immediate neighborhood geometry check (simplified)
-        missing_neighbor = False
-        potential_neighbor_v = np.array([0,0])
-        
-        # Check if neighbors are clustered only on one side (meaning it's a boundary point with a hole nearby)
-        neighbor_vs = final_points[neighbors_idx] - current_pt
-        mean_v = np.mean(neighbor_vs, axis=0)
-        
-        if np.linalg.norm(mean_v) > median_spacing * 0.6:
-            # Clustered geometry. Missing neighbor is likely on the opposite side of the Mean_v
-            potential_neighbor_v = -mean_v
-            missing_neighbor = True
-            
-        if missing_neighbor:
-            # We found a gap. Validate if the hole is real by checking if ANY final_point exists there.
-            # Ideal hole location: current + (ideal pitch vector). We use scaled mean_v as a proxy.
-            ideal_hole_loc = current_pt + potential_neighbor_v
-            
-            # Use kdtree to check if ANY point exists near this ideal hole
-            hole_dist, _ = pattern_tree.query(ideal_hole_loc, k=1)
-            
-            # Check against synthetic tolerance. Also don't add holes too close to existing dots or other synthesized holes
-            if hole_dist > median_spacing * 1.5: # 1.5 means no dot exists roughly where one *should* be
-                 # Found a hole! Synthesize the missing neighbor
-                 new_p = ideal_hole_loc.astype(int)
-                 imputed_points.append(new_p)
-                 
-    logs.append(f"**INPAINTING:** Synthesized {len(imputed_points)} artificial dots to fill pattern holes.")
-    
-    # VISUALIZE IMPUTED DOTS IN YELLOW on validation image
-    for p in imputed_points:
-        px, py = int(p[0]), int(p[1])
-        cv2.circle(verification_img, (px, py), 4, (0, 255, 255), -1)
-
-    # Blend validated and imputed dots for final physics processing
-    final_processing_list = validated_dots + imputed_points
-    points = np.array(final_processing_list)
-    
-    # Re-run KD-Tree on complete, cleaned dataset for physical model
+    # --- KD-Tree Processing ---
+    points = np.array(dots)
     tree = cKDTree(points)
     dist, indices = tree.query(points, k=5) 
     
-    # heatmap data loop continues as normal using this cleaned list.
     heatmap_data = [] 
+    
+    all_neighbor_dists = dist[:, 1:].flatten()
+    median_spacing = np.median(all_neighbor_dists)
+         
+    logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px")
+    
     max_valid_dist = baseline_dist * 3.0
     
+    # --- loop to generate heatmap data only ---
     for i, d_list in enumerate(dist):
         neighbors = d_list[1:]
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
+        # Signed Strain using adjusted baseline
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
+        
         px, py = points[i]
         heatmap_data.append([px, py, strain])
         
+        # Remove drawing black dots on final output as it clutters the blend
+
     # ==========================================
     # FIND IMAGE MID POINT STRESS
     # ==========================================
     sig_x_disp = 0.0
     sig_y_disp = 0.0
+    
+    # Absolute geometric center of the (potentially scaled) image
     img_center = np.array([w / 2, h / 2])
     
+    # query tree for the dot closest to absolute center (k=1)
     center_dist, target_idx = tree.query(img_center, k=1)
     
     hotspot_loc = points[target_idx]
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
+    # Calculate stress for center dot using adjusted baseline
     sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
                                     modulus_mpa, poisson_ratio, strain_factor)
     sig_x_disp = sx
     sig_y_disp = sy
     
-    logs.append(f"**Analysis Point:** Closest blob to center at {hotspot_loc}")
+    logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
     logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
@@ -323,12 +229,15 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         pts = np.float32([p[:2] for p in heatmap_data])
         vals = np.float32([p[2] for p in heatmap_data])
         
+        # Create Grid
         grid_x, grid_y = np.mgrid[0:w_img:4, 0:h_img:4]
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
+        # Transpose to get (height, width) for OpenCV
         full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) 
         
+        # --- SYMMETRIC SCALING (Blue=Neg, Red=Pos) ---
         limit = max(abs(np.min(full_grid_z)), abs(np.max(full_grid_z)))
         if limit < 0.01: limit = 0.01
         
@@ -336,14 +245,17 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         norm_map = np.clip(norm_map, 0, 1)
         full_norm_uint8 = (norm_map * 255).astype('uint8')
         
+        # Apply topographic JET map
         color_map = cv2.applyColorMap(full_norm_uint8, cv2.COLORMAP_JET)
         
+        # --- AREA MASK (CONVEX HULL) ---
         hull_mask = np.zeros((h_img, w_img), dtype=np.uint8)
-        hull_pts = cv2.convexHull(points.astype(np.int32)) # use complete dataset for hull mask
+        hull_pts = cv2.convexHull(np.array(dots).astype(np.int32))
         cv2.fillPoly(hull_mask, [hull_pts], 255)
         
         mask_3ch = np.dstack([hull_mask]*3) > 128
         
+        # --- BLEND (60% Color + 40% Original) ---
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.6, output, 0.4, 0), output)
         
         # Mask Reference Area visual
@@ -370,6 +282,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         
         cv2.circle(output, (mx, my), 5, (255, 0, 255), 2, cv2.LINE_AA)
 
+    # Returned 4 values now
     return output, logs, binary_micro, verification_img 
 
 # ==========================================
@@ -380,11 +293,11 @@ st.title("🔬 Universal Stress Analyzer")
 
 with st.sidebar:
     st.header("1. Detection Tuning")
-    st.info("Adjust these if you see extreme noise or missing blobs. Compare Verification Map.")
+    st.info("Adjust these if you see 'Snow' or missing dots.")
     
-    blur_val = st.slider("Noise Reduction Blur", 1, 15, 11, step=2, help="User optimized Blur:11 recommended.")
-    thresh_block = st.slider("Threshold Sensitivity", 3, 31, 3, step=2, help="User optimized T:3 (High Sensitivity) recommended.")
-    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5, help="Filters out noise chunks/fibers based on bounded pixel size.")
+    blur_val = st.slider("Blur Amount", 1, 15, 9, step=2)
+    thresh_block = st.slider("Threshold Sensitivity", 3, 31, 17, step=2)
+    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5)
     
     st.divider()
     st.header("2. Calibration")
@@ -411,6 +324,7 @@ if image_file is not None:
     if st.button("RUN ANALYSIS", type="primary"):
         with st.spinner("Processing..."):
             original_image = Image.open(image_file)
+            # Unpack 4 returned values
             result_img, logs, binary_view, dots_view = analyze_dot_pattern(
                 original_image, modulus, poisson, strain_factor,
                 blur_val, thresh_block, min_area, manual_spacing,
@@ -426,16 +340,17 @@ if image_file is not None:
                 st.subheader("Analysis Data")
                 for line in logs: st.markdown(line)
                 
-                # --- VERIFICATION SECTION ---
+                # --- NEW VERIFICATION SECTION ---
                 st.divider()
                 st.subheader("Computer Vision Verification")
-                st.info("Observe if noise is being incorrectly marked as dots. GREEN marks core grid blobs, YELLOW marks inpainted blobs.")
+                st.info("Compare these images to know if dots are detected correctly. Green marks successful dots.")
                 
                 exp_col1, exp_col2 = st.columns(2)
                 with exp_col1:
-                    with st.expander("1. Raw Candidate Mask", expanded=True):
-                        st.image(binary_view, caption="Shows all noise (grain/fibers)", use_container_width=True)
+                    with st.expander("1. Raw Binary Mask", expanded=True):
+                        # adaptiveThreshold output (grayscale)
+                        st.image(binary_view, caption="Shows noise/dot edges", use_container_width=True)
                 with exp_col2:
-                    with st.expander("2. Valid Blobs Detected", expanded=True):
+                    with st.expander("2. Dots Detected", expanded=True):
                         # BGR image with overlays
-                        st.image(dots_view, caption="G: Valid, Y: Artificial, Blue: Candidates, Red: Outliers", use_container_width=True, channels="BGR")
+                        st.image(dots_view, caption="Green Circles = Valid Dots", use_container_width=True, channels="BGR")
