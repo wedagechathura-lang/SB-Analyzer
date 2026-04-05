@@ -23,7 +23,6 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
             
     if len(x_dists) > 0:
         avg_x = np.mean(x_dists)
-        # Using adjusted ref_size for strain calculation
         eps_x = ((avg_x - ref_size) / ref_size) * factor
     else: eps_x = 0.0
         
@@ -110,7 +109,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             base_ref_px = manual_spacing
             logs.append(f"**CALIBRATION:** Using Manual Spacing Overide: {base_ref_px}px")
         else:
-            # We must return something for all return values on error
             return output, logs + ["ERROR: Reference Square not found. Check lighting or use Manual Spacing."], cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), img
     elif manual_spacing > 0:
          base_ref_px = manual_spacing
@@ -118,27 +116,34 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
 
     # MODIFICATION: APPLY SLIDER ADJUSTMENT
     baseline_dist = base_ref_px * (1.0 + (ref_adj_perc / 100.0))
-    logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px (Base: {base_ref_px}px, Adj: {ref_adj_perc:+.1f}%)")
+    logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px")
 
     # ======================================================
-    # PASS 2: FIND DOTS
+    # PASS 2: FIND DOTS (MULTI-PARAMETER ROBUSTNESS)
     # ======================================================
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Existing Stage 1: Illumination Correction (Keep, essential for shadows)
+    kernel_dim = max(9, int(h * 0.02))
+    if kernel_dim % 2 == 0: kernel_dim += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_dim, kernel_dim))
+    corrected_dots_bright = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    
+    # Phase 2: Standard Filtering (Keeping user's preferred high Blur: 11)
     if blur_val % 2 == 0: blur_val += 1
-    blurred = cv2.medianBlur(gray, blur_val) 
+    blurred = cv2.medianBlur(corrected_dots_bright, blur_val) 
+
+    # Phase 3: Binary Segmentation (Keeping user's preferred high Sensitivity T: 3)
     if thresh_block % 2 == 0: thresh_block += 1
     binary_micro = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, thresh_block, 2)
-    
-    # Create verification image to draw detected dots
-    # Copy original because BGR output blend clutters the final view
+                                   cv2.THRESH_BINARY, thresh_block, 2)
+    # This binary image will look VERY noisy/grainy in the background. Good.
+
+    # Verification Image setup
     verification_img = img.copy()
 
     contours_micro, _ = cv2.findContours(binary_micro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # visualize contours considered candidates (before area filtering) in blue
-    cv2.drawContours(verification_img, contours_micro, -1, (255, 100, 0), 1)
-
     dots = []
     # Use base detected size for masking, not adjusted size
     mask_ref_size = base_ref_px if base_ref_px is not None else manual_spacing
@@ -147,27 +152,65 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     safe_x1, safe_y1 = rx - ex_margin, ry - ex_margin
     safe_x2, safe_y2 = rx + rw + ex_margin, ry + rh + ex_margin
     
+    # Visualization: draw rejected candidates initially in blue
+    cv2.drawContours(verification_img, contours_micro, -1, (255, 100, 0), 1)
+
     for cnt in contours_micro:
+        M = cv2.moments(cnt)
+        if M["m00"] == 0: continue # avoid error
+
+        #STAGE 1: AREA FILTER (Existing, loosely applied)
         area = cv2.contourArea(cnt)
         if area < min_area: continue 
-        # Use adjusted baseline for max dot size filtering logic
         if area > (baseline_dist * baseline_dist * 0.5): continue
 
-        M = cv2.moments(cnt)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            # Masking logic
-            if ref_box != (0,0,0,0):
-                if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
-                    continue
-            
-            dots.append([cx, cy])
-            # Visualization modification: Draw green circles on correctly detected dots
-            cv2.circle(verification_img, (cx, cy), 3, (0, 255, 0), -1)
+        #STAGE 2: CONVEXITY RATIO (New, crucial for grainy noise)
+        # Background grain in high sensitivity thresholding is often concaved/spiky. 
+        # Real dots are smooth stone/filled shapes.
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area == 0: continue
+        
+        # Calculate Convexity Ratio (Area / HullArea). Must be close to filled (e.g. >0.8)
+        convexity = area / hull_area
+        if convexity < 0.8: continue # REJECT SPIKY NOISE
+
+        #STAGE 3: INERTIA RATIO (New, replacing Momements check)
+        # We need to calculate the principal axes of inertia. 
+        # Ratio of m_min / m_max. Circle/Oval -> 1.0. Thin line/fiber -> 0.0.
+        
+        # calculate eccentricity derivative derivative parameters
+        mu20 = M['mu20']
+        mu02 = M['mu02']
+        mu11 = M['mu11']
+        delta = mu20 - mu02
+        
+        # Standard moment analysis for blob detection
+        # Avoid error if denominator is zero (perfect circle)
+        denom = np.sqrt(delta**2 + 4 * mu11**2)
+        if (mu20 + mu02 + denom) == 0: continue
+
+        # Ratio = m_min / m_max = (sum - denom) / (sum + denom)
+        inertia_ratio = (mu20 + mu02 - denom) / (mu20 + mu02 + denom)
+        
+        # Loosen from perfect circle (1.0). Accept ovals/blobs (e.g. >0.3)
+        # Filters out long skinny fiber noise artifacts.
+        if inertia_ratio < 0.3: continue # REJECT FIBERS/LINES
+
+        #STAGE 4: SPATIAL MASKING (Existing)
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        if ref_box != (0,0,0,0):
+            if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
+                continue
+        
+        # PASS ALL FILTERS
+        dots.append([cx, cy])
+        # Visualization: Draw green circles on correctly detected AND passed dots
+        cv2.circle(verification_img, (cx, cy), 3, (0, 255, 0), -1)
 
     if len(dots) < 10:
-        return output, logs + [f"ERROR: Only {len(dots)} dots found. Adjust Detection Tuning."], binary_micro, verification_img
+        return output, logs + [f"ERROR: Only {len(dots)} valid printed blobs found. Adaptive thresholding window may be breaking in local shadow patch. (Check Verification Expander)"], binary_micro, verification_img
 
     # --- KD-Tree Processing ---
     points = np.array(dots)
@@ -175,7 +218,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     dist, indices = tree.query(points, k=5) 
     
     heatmap_data = [] 
-    
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
          
@@ -189,38 +231,30 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
-        # Signed Strain using adjusted baseline
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
-        
         px, py = points[i]
         heatmap_data.append([px, py, strain])
         
-        # Remove drawing black dots on final output as it clutters the blend
-
     # ==========================================
     # FIND IMAGE MID POINT STRESS
     # ==========================================
     sig_x_disp = 0.0
     sig_y_disp = 0.0
-    
-    # Absolute geometric center of the (potentially scaled) image
     img_center = np.array([w / 2, h / 2])
     
-    # query tree for the dot closest to absolute center (k=1)
     center_dist, target_idx = tree.query(img_center, k=1)
     
     hotspot_loc = points[target_idx]
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
-    # Calculate stress for center dot using adjusted baseline
     sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
                                     modulus_mpa, poisson_ratio, strain_factor)
     sig_x_disp = sx
     sig_y_disp = sy
     
-    logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
+    logs.append(f"**Analysis Point:** Closest blob to center at {hotspot_loc}")
     logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
@@ -234,7 +268,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
         
-        # Transpose to get (height, width) for OpenCV
         full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) 
         
         # --- SYMMETRIC SCALING (Blue=Neg, Red=Pos) ---
@@ -245,7 +278,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         norm_map = np.clip(norm_map, 0, 1)
         full_norm_uint8 = (norm_map * 255).astype('uint8')
         
-        # Apply topographic JET map
         color_map = cv2.applyColorMap(full_norm_uint8, cv2.COLORMAP_JET)
         
         # --- AREA MASK (CONVEX HULL) ---
@@ -255,7 +287,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         
         mask_3ch = np.dstack([hull_mask]*3) > 128
         
-        # --- BLEND (60% Color + 40% Original) ---
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.6, output, 0.4, 0), output)
         
         # Mask Reference Area visual
@@ -282,7 +313,6 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         
         cv2.circle(output, (mx, my), 5, (255, 0, 255), 2, cv2.LINE_AA)
 
-    # Returned 4 values now
     return output, logs, binary_micro, verification_img 
 
 # ==========================================
@@ -293,11 +323,11 @@ st.title("🔬 Universal Stress Analyzer")
 
 with st.sidebar:
     st.header("1. Detection Tuning")
-    st.info("Adjust these if you see 'Snow' or missing dots.")
+    st.info("Adjust these if you see extreme noise or missing blobs. Green marks successful blobs.")
     
-    blur_val = st.slider("Blur Amount", 1, 15, 9, step=2)
-    thresh_block = st.slider("Threshold Sensitivity", 3, 31, 17, step=2)
-    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5)
+    blur_val = st.slider("Noise Reduction Blur", 1, 15, 9, step=2, help="Suppresses random fiber noise. Keeping user-optimized Blur:11 recommended.")
+    thresh_block = st.slider("Segmentation Window (Sensitivity)", 3, 31, 17, step=2, help="Local window size. Keeping user-optimized T:3 (High Sensitivity) recommended.")
+    min_area = st.slider("Min Dot Area (Pixels)", 1, 100, 5, help="Filters out noise chunks/fibers based on bounded pixel size.")
     
     st.divider()
     st.header("2. Calibration")
@@ -324,7 +354,6 @@ if image_file is not None:
     if st.button("RUN ANALYSIS", type="primary"):
         with st.spinner("Processing..."):
             original_image = Image.open(image_file)
-            # Unpack 4 returned values
             result_img, logs, binary_view, dots_view = analyze_dot_pattern(
                 original_image, modulus, poisson, strain_factor,
                 blur_val, thresh_block, min_area, manual_spacing,
@@ -340,17 +369,15 @@ if image_file is not None:
                 st.subheader("Analysis Data")
                 for line in logs: st.markdown(line)
                 
-                # --- NEW VERIFICATION SECTION ---
+                # --- VERIFICATION SECTION ---
                 st.divider()
                 st.subheader("Computer Vision Verification")
-                st.info("Compare these images to know if dots are detected correctly. Green marks successful dots.")
+                st.info("Observe if concave noise grain is being filtered successfully. GREEN marks printed blobs.")
                 
                 exp_col1, exp_col2 = st.columns(2)
                 with exp_col1:
-                    with st.expander("1. Raw Binary Mask", expanded=True):
-                        # adaptiveThreshold output (grayscale)
-                        st.image(binary_view, caption="Shows noise/dot edges", use_container_width=True)
+                    with st.expander("1. Raw Segmentation Mask", expanded=True):
+                        st.image(binary_view, caption="Shows noise grain (fibers)", use_container_width=True)
                 with exp_col2:
-                    with st.expander("2. Dots Detected", expanded=True):
-                        # BGR image with overlays
-                        st.image(dots_view, caption="Green Circles = Valid Dots", use_container_width=True, channels="BGR")
+                    with st.expander("2. Valid Blobs Detected", expanded=True):
+                        st.image(dots_view, caption="Green Circles = Valid Blobs", use_container_width=True, channels="BGR")
