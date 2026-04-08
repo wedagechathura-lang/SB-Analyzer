@@ -216,17 +216,17 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
-    # MODIFIED: Unpack 4 values including X and Y strain
+   # MODIFIED: Unpack 4 values including X and Y strain
     sx, sy, ex, ey = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
                                             modulus_mpa, poisson_ratio, strain_factor)
     sig_x_disp = sx
     sig_y_disp = sy
     
-    # MODIFIED: Added Strain X and Strain Y to the logs
-    logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
-    logs.append(f"**Center Strain X:** {ex:.4f} ε")
-    logs.append(f"**Center Strain Y:** {ey:.4f} ε")
-    logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
+    # MODIFIED: Reordered logs to put Strain at the top
+    logs.insert(0, f"**Center Stress:** {sx:.2f} MPa (X)") # Insert Stress at top
+    logs.insert(0, f"**Center Strain Y:** {ey:.4f} ε") # Insert Strain Y above Stress
+    logs.insert(0, f"**Center Strain X:** {ex:.4f} ε") # Insert Strain X above Strain Y
+    logs.insert(0, f"**Analysis Point:** Closest dot to center at {hotspot_loc}") # Insert Analysis point at very top
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
     if heatmap_data:
@@ -337,7 +337,7 @@ if image_file is not None:
             
             col1, col2 = st.columns([2, 1])
             with col1:
-                st.subheader("Stress Topography Heatmap (-15 to 15 MPa)")
+                st.subheader("Stress Topography Heatmap")
                 st.image(result_img, channels="BGR", use_container_width=True)
             
             with col2:
