@@ -38,7 +38,8 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
     sigma_x = K * (eps_x + (nu * eps_y))
     sigma_y = K * (eps_y + (nu * eps_x))
     
-    return sigma_x, sigma_y
+    # MODIFIED: Now returning eps_x and eps_y as well
+    return sigma_x, sigma_y, eps_x, eps_y
 
 # ==========================================
 # 2. ANALYSIS LOGIC
@@ -178,7 +179,7 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
-         
+          
     logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px")
     
     max_valid_dist = baseline_dist * 3.0
@@ -193,10 +194,11 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
         
-        px, py = points[i]
-        heatmap_data.append([px, py, strain])
+        # MODIFIED: Convert strain to Stress (MPa) for the color map
+        stress_val = strain * modulus_mpa
         
-        # Remove drawing black dots on final output as it clutters the blend
+        px, py = points[i]
+        heatmap_data.append([px, py, stress_val])
 
     # ==========================================
     # FIND IMAGE MID POINT STRESS
@@ -214,13 +216,16 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
-    # Calculate stress for center dot using adjusted baseline
-    sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
-                                    modulus_mpa, poisson_ratio, strain_factor)
+    # MODIFIED: Unpack 4 values including X and Y strain
+    sx, sy, ex, ey = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
+                                            modulus_mpa, poisson_ratio, strain_factor)
     sig_x_disp = sx
     sig_y_disp = sy
     
+    # MODIFIED: Added Strain X and Strain Y to the logs
     logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
+    logs.append(f"**Center Strain X:** {ex:.4f} ε")
+    logs.append(f"**Center Strain Y:** {ey:.4f} ε")
     logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
     # --- Heatmap Generation (CONTINUOUS JET) ---
@@ -237,11 +242,12 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         # Transpose to get (height, width) for OpenCV
         full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) 
         
-        # --- SYMMETRIC SCALING (Blue=Neg, Red=Pos) ---
-        limit = max(abs(np.min(full_grid_z)), abs(np.max(full_grid_z)))
-        if limit < 0.01: limit = 0.01
+        # MODIFIED: FIXED SCALING (-15 to 15 MPa) 
+        # This makes -15=Blue, 0=Green, +15=Red
+        vmin = -15.0
+        vmax = 15.0
         
-        norm_map = (full_grid_z + limit) / (2 * limit)
+        norm_map = (full_grid_z - vmin) / (vmax - vmin)
         norm_map = np.clip(norm_map, 0, 1)
         full_norm_uint8 = (norm_map * 255).astype('uint8')
         
@@ -313,7 +319,7 @@ with st.sidebar:
     st.divider()
     st.header("3. Physics")
     modulus = st.number_input("Young's Modulus (MPa)", value=51.0)
-    poisson = st.number_input("Poisson's Ratio", value=0.3)
+    poisson = st.number_input("Poisson's Ratio", value=0.01, format="%.2f")
     strain_factor = st.number_input("Calibration Factor", value=1.0)
 
 image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
@@ -331,7 +337,7 @@ if image_file is not None:
             
             col1, col2 = st.columns([2, 1])
             with col1:
-                st.subheader("Stress Topography heat map")
+                st.subheader("Stress Topography Heatmap (-15 to 15 MPa)")
                 st.image(result_img, channels="BGR", use_container_width=True)
             
             with col2:
