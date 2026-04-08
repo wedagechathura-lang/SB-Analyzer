@@ -1,14 +1,16 @@
 import streamlit as st
 import cv2
 import numpy as np
+import pandas as pd
+import plotly.express as px
 from PIL import Image
 from scipy.spatial import cKDTree
 from scipy.interpolate import griddata
 
 # ==========================================
-# 1. PHYSICS MATH ENGINE
+# 1. PHYSICS MATH ENGINE (NON-LINEAR DYNAMIC)
 # ==========================================
-def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
+def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E_fallback, nu, factor, use_dynamic=True):
     cx, cy = center_pt
     x_dists = []
     y_dists = []
@@ -23,7 +25,6 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
             
     if len(x_dists) > 0:
         avg_x = np.mean(x_dists)
-        # Using adjusted ref_size for strain calculation
         eps_x = ((avg_x - ref_size) / ref_size) * factor
     else: eps_x = 0.0
         
@@ -31,20 +32,41 @@ def calculate_plane_stress(center_pt, neighbor_pts, ref_size, E, nu, factor):
         avg_y = np.mean(y_dists)
         eps_y = ((avg_y - ref_size) / ref_size) * factor
     else: eps_y = 0.0
+
+    # --------------------------------------------------------
+    # THESIS UPGRADE: NON-LINEAR DYNAMIC TANGENT MODULUS
+    # --------------------------------------------------------
+    if use_dynamic:
+        # 1. Find local equivalent strain
+        local_equivalent_strain = abs(max(eps_x, eps_y))
+        
+        # 2. Equation Coefficients from averaging Sample 0 and Sample 3
+        A = 4.76e10
+        B = -7.38e9
+        C = 3.32e8
+        
+        # 3. Calculate local E in Pascals
+        local_E_pa = (A * (local_equivalent_strain**2)) + (B * local_equivalent_strain) + C
+        
+        # 4. Convert to MPa and set a minimum floor to avoid math errors at failure point
+        local_E = max(local_E_pa / 1e6, 0.1)
+    else:
+        local_E = E_fallback
+    # --------------------------------------------------------
         
     if (1 - nu**2) == 0: K = 0 
-    else: K = E / (1 - nu**2)
+    else: K = local_E / (1 - nu**2)
     
     sigma_x = K * (eps_x + (nu * eps_y))
     sigma_y = K * (eps_y + (nu * eps_x))
     
-    return sigma_x, sigma_y
+    return sigma_x, sigma_y, local_E
 
 # ==========================================
-# 2. ANALYSIS LOGIC
+# 2. ANALYSIS LOGIC (VISION ENGINE)
 # ==========================================
 def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor, 
-                       blur_val, thresh_block, min_area, manual_spacing, ref_adj_perc):
+                       blur_val, thresh_block, min_area, manual_spacing, ref_adj_perc, use_dynamic):
     logs = []
     
     image_np = np.array(image.convert('RGB'))
@@ -110,13 +132,11 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
             base_ref_px = manual_spacing
             logs.append(f"**CALIBRATION:** Using Manual Spacing Overide: {base_ref_px}px")
         else:
-            # We must return something for all return values on error
             return output, logs + ["ERROR: Reference Square not found. Check lighting or use Manual Spacing."], cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), img
     elif manual_spacing > 0:
          base_ref_px = manual_spacing
          logs.append(f"**CALIBRATION:** Overriding detected square with Manual Spacing: {base_ref_px}px")
 
-    # MODIFICATION: APPLY SLIDER ADJUSTMENT
     baseline_dist = base_ref_px * (1.0 + (ref_adj_perc / 100.0))
     logs.append(f"**CALIBRATION:** Final Baseline Reference = {baseline_dist:.2f}px (Base: {base_ref_px}px, Adj: {ref_adj_perc:+.1f}%)")
 
@@ -130,17 +150,11 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     binary_micro = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, thresh_block, 2)
     
-    # Create verification image to draw detected dots
-    # Copy original because BGR output blend clutters the final view
     verification_img = img.copy()
-
     contours_micro, _ = cv2.findContours(binary_micro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # visualize contours considered candidates (before area filtering) in blue
     cv2.drawContours(verification_img, contours_micro, -1, (255, 100, 0), 1)
 
     dots = []
-    # Use base detected size for masking, not adjusted size
     mask_ref_size = base_ref_px if base_ref_px is not None else manual_spacing
     ex_margin = mask_ref_size * 0.8
     rx, ry, rw, rh = ref_box
@@ -150,20 +164,17 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     for cnt in contours_micro:
         area = cv2.contourArea(cnt)
         if area < min_area: continue 
-        # Use adjusted baseline for max dot size filtering logic
         if area > (baseline_dist * baseline_dist * 0.5): continue
 
         M = cv2.moments(cnt)
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            # Masking logic
             if ref_box != (0,0,0,0):
                 if (cx > safe_x1) and (cx < safe_x2) and (cy > safe_y1) and (cy < safe_y2):
                     continue
             
             dots.append([cx, cy])
-            # Visualization modification: Draw green circles on correctly detected dots
             cv2.circle(verification_img, (cx, cy), 3, (0, 255, 0), -1)
 
     if len(dots) < 10:
@@ -175,12 +186,10 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     dist, indices = tree.query(points, k=5) 
     
     heatmap_data = [] 
-    
     all_neighbor_dists = dist[:, 1:].flatten()
     median_spacing = np.median(all_neighbor_dists)
-         
+          
     logs.append(f"**Median Dot Distance:** {median_spacing:.1f}px")
-    
     max_valid_dist = baseline_dist * 3.0
     
     # --- loop to generate heatmap data only ---
@@ -189,14 +198,14 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         if np.max(neighbors) > max_valid_dist: continue
 
         local_avg = np.mean(neighbors)
-        # Signed Strain using adjusted baseline
         strain = (local_avg - baseline_dist) / baseline_dist
         strain = strain * strain_factor
         
-        px, py = points[i]
-        heatmap_data.append([px, py, strain])
+        # Convert strain to Stress (MPa) for the topographic map
+        stress_val = strain * modulus_mpa
         
-        # Remove drawing black dots on final output as it clutters the blend
+        px, py = points[i]
+        heatmap_data.append([px, py, stress_val])
 
     # ==========================================
     # FIND IMAGE MID POINT STRESS
@@ -204,32 +213,30 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
     sig_x_disp = 0.0
     sig_y_disp = 0.0
     
-    # Absolute geometric center of the (potentially scaled) image
     img_center = np.array([w / 2, h / 2])
-    
-    # query tree for the dot closest to absolute center (k=1)
     center_dist, target_idx = tree.query(img_center, k=1)
     
     hotspot_loc = points[target_idx]
     n_indices = indices[target_idx, 1:]
     center_pt = points[target_idx]
     
-    # Calculate stress for center dot using adjusted baseline
-    sx, sy = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
-                                    modulus_mpa, poisson_ratio, strain_factor)
+    # Passed use_dynamic and unpacked center_E
+    sx, sy, center_E = calculate_plane_stress(center_pt, points[n_indices], baseline_dist, 
+                                              modulus_mpa, poisson_ratio, strain_factor, use_dynamic)
     sig_x_disp = sx
     sig_y_disp = sy
     
     logs.append(f"**Analysis Point:** Closest dot to center at {hotspot_loc}")
+    if use_dynamic:
+        logs.append(f"**Dynamic Modulus (E) at Center:** {center_E:.2f} MPa")
     logs.append(f"**Center Stress:** {sx:.2f} MPa (X)")
 
-    # --- Heatmap Generation (CONTINUOUS JET) ---
+    # --- Heatmap Generation ---
     if heatmap_data:
         h_img, w_img = img.shape[:2]
         pts = np.float32([p[:2] for p in heatmap_data])
         vals = np.float32([p[2] for p in heatmap_data])
         
-        # Create Grid
         grid_x, grid_y = np.mgrid[0:w_img:4, 0:h_img:4]
         grid_z = griddata(pts, vals, (grid_x, grid_y), method='linear', fill_value=0)
         grid_z = np.nan_to_num(grid_z)
@@ -237,58 +244,47 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         # Transpose to get (height, width) for OpenCV
         full_grid_z = cv2.resize(grid_z.T, (w_img, h_img)) 
         
-        # --- SYMMETRIC SCALING (Blue=Neg, Red=Pos) ---
-        limit = max(abs(np.min(full_grid_z)), abs(np.max(full_grid_z)))
-        if limit < 0.01: limit = 0.01
+        # --- FIXED SCALING (1 to 15 MPa) ---
+        vmin = 1.0
+        vmax = 15.0
         
-        norm_map = (full_grid_z + limit) / (2 * limit)
+        norm_map = (full_grid_z - vmin) / (vmax - vmin)
         norm_map = np.clip(norm_map, 0, 1)
         full_norm_uint8 = (norm_map * 255).astype('uint8')
         
-        # Apply topographic JET map
         color_map = cv2.applyColorMap(full_norm_uint8, cv2.COLORMAP_JET)
         
-        # --- AREA MASK (CONVEX HULL) ---
         hull_mask = np.zeros((h_img, w_img), dtype=np.uint8)
         hull_pts = cv2.convexHull(np.array(dots).astype(np.int32))
         cv2.fillPoly(hull_mask, [hull_pts], 255)
         
         mask_3ch = np.dstack([hull_mask]*3) > 128
         
-        # --- BLEND (60% Color + 40% Original) ---
         output = np.where(mask_3ch, cv2.addWeighted(color_map, 0.6, output, 0.4, 0), output)
         
-        # Mask Reference Area visual
         if ref_box != (0,0,0,0):
              cv2.rectangle(output, (int(safe_x1), int(safe_y1)), (int(safe_x2), int(safe_y2)), (40, 40, 40), -1)
              cv2.rectangle(output, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
 
-        # Draw Label for Mid Point stress as a simple tag
         mx, my = int(hotspot_loc[0]), int(hotspot_loc[1])
         label_text = f"Center Stress: {sig_x_disp:.2f} MPa"
         
-        # Determine color for entire tag: Tension is blue, compression is red.
         col_tag = (0, 0, 255) if sig_x_disp > 0 else (255, 0, 0) 
         
-        # New simplified white box for a single line
         cv2.rectangle(output, (mx, my - 35), (mx + 260, my + 10), (255, 255, 255), -1)
         cv2.rectangle(output, (mx, my - 35), (mx + 260, my + 10), (0, 0, 0), 2)
-        
-        # Single line text rendering
         cv2.putText(output, label_text, (mx+5, my-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col_tag, 2, cv2.LINE_AA)
-        
-        # Keep original magenta center circle
         cv2.circle(output, (mx, my), 5, (255, 0, 255), 2, cv2.LINE_AA)
 
-    # Returned 4 values now
     return output, logs, binary_micro, verification_img 
 
 # ==========================================
 # 3. STREAMLIT UI
 # ==========================================
-st.set_page_config(page_title="Universal Stress Analyzer", layout="wide")
-st.title("🔬 Universal Stress Analyzer")
+st.set_page_config(page_title="Smart Stress Analyzer", layout="wide")
+st.title("🔬 Smart Nanofiber Stress Analyzer")
 
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("1. Detection Tuning")
     st.info("Adjust these if you see 'Snow' or missing dots.")
@@ -299,56 +295,73 @@ with st.sidebar:
     
     st.divider()
     st.header("2. Calibration")
-    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0, help="Manually set baseline pixel distance between dots, ignoring detected square.")
-    
-    ref_adj_perc = st.slider(
-        "Fine-tune Reference Baseline (%)", 
-        min_value=-20.0, 
-        max_value=20.0, 
-        value=0.0, 
-        step=0.1,
-        help="Adjust the calculated resting dot distance. Positive increases resting length (shifting map towards compression), negative decreases it. Use to set specific map regions to zero stress."
-    )
+    manual_spacing = st.number_input("Manual Spacing Override (px)", value=0.0)
+    ref_adj_perc = st.slider("Fine-tune Reference Baseline (%)", -20.0, 20.0, 0.0, step=0.1)
     
     st.divider()
-    st.header("3. Physics")
-    modulus = st.number_input("Young's Modulus (MPa)", value=51.0)
+    st.header("3. Physics Engine")
+    
+    # NEW UI CHECKBOX FOR THESIS
+    use_dynamic = st.checkbox("Use Non-Linear Master Curve", value=True, help="Calculates E dynamically using the 3rd-degree polynomial derived from PVA mat Samples 0 and 3.")
+    
+    if use_dynamic:
+        st.success("Dynamic Equation Active:")
+        st.latex(r"E(\epsilon) = 4.76 \times 10^{10}\epsilon^2 - 7.38 \times 10^{9}\epsilon + 3.32 \times 10^{8}")
+        modulus = 51.0 # Ignored by engine, kept for variable safety
+    else:
+        modulus = st.number_input("Constant Young's Modulus (MPa)", value=51.0)
+        
     poisson = st.number_input("Poisson's Ratio", value=0.3)
     strain_factor = st.number_input("Calibration Factor", value=1.0)
 
-image_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
+# --- MAIN PANEL: TABS ---
+tab1, tab2 = st.tabs(["🔴 Smart Vision Analysis", "📊 Material Data Reference"])
 
-if image_file is not None:
-    if st.button("RUN ANALYSIS", type="primary"):
-        with st.spinner("Processing..."):
-            original_image = Image.open(image_file)
-            # Unpack 4 returned values
-            result_img, logs, binary_view, dots_view = analyze_dot_pattern(
-                original_image, modulus, poisson, strain_factor,
-                blur_val, thresh_block, min_area, manual_spacing,
-                ref_adj_perc
-            )
-            
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.subheader("Stress Topography heat map")
-                st.image(result_img, channels="BGR", use_container_width=True)
-            
-            with col2:
-                st.subheader("Analysis Data")
-                for line in logs: st.markdown(line)
+with tab2:
+    st.subheader("Tensile Data Analyzer")
+    st.info("Demonstrating the source of the Non-Linear Master Curve")
+    
+    # Plotly block to let you show your curves dynamically during defense
+    try:
+        sample_choice = st.selectbox("View Sample Data", ["0.csv", "1.csv", "2.csv", "3.csv"])
+        df_tensile = pd.read_csv(sample_choice)
+        
+        fig = px.line(df_tensile, x='Strain', y='Stress', title=f"Stress-Strain Curve ({sample_choice})")
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning("Make sure your 0.csv, 1.csv, etc. are in the same folder as this script to view them.")
+
+with tab1:
+    image_file = st.file_uploader("Upload DIC Image", type=['jpg', 'png', 'jpeg'])
+
+    if image_file is not None:
+        if st.button("RUN ANALYSIS", type="primary"):
+            with st.spinner("Processing Application of Dynamic Math Engine..."):
+                original_image = Image.open(image_file)
                 
-                # --- NEW VERIFICATION SECTION ---
-                st.divider()
-                st.subheader("Computer Vision Verification")
-                st.info("Compare these images to know if dots are detected correctly. Green marks successful dots.")
+                # Unpack 4 returned values, pass use_dynamic
+                result_img, logs, binary_view, dots_view = analyze_dot_pattern(
+                    original_image, modulus, poisson, strain_factor,
+                    blur_val, thresh_block, min_area, manual_spacing,
+                    ref_adj_perc, use_dynamic
+                )
                 
-                exp_col1, exp_col2 = st.columns(2)
-                with exp_col1:
-                    with st.expander("1. Raw Binary Mask", expanded=True):
-                        # adaptiveThreshold output (grayscale)
-                        st.image(binary_view, caption="Shows noise/dot edges", use_container_width=True)
-                with exp_col2:
-                    with st.expander("2. Dots Detected", expanded=True):
-                        # BGR image with overlays
-                        st.image(dots_view, caption="Green Circles = Valid Dots", use_container_width=True, channels="BGR")
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.subheader("Stress Topography Heatmap (1-15 MPa Range)")
+                    st.image(result_img, channels="BGR", use_container_width=True)
+                
+                with col2:
+                    st.subheader("Analysis Data")
+                    for line in logs: st.markdown(line)
+                    
+                    st.divider()
+                    st.subheader("Computer Vision Verification")
+                    
+                    exp_col1, exp_col2 = st.columns(2)
+                    with exp_col1:
+                        with st.expander("1. Binary Mask", expanded=True):
+                            st.image(binary_view, caption="Noise/Edges", use_container_width=True)
+                    with exp_col2:
+                        with st.expander("2. Detected Dots", expanded=True):
+                            st.image(dots_view, caption="Green Circles = Valid", use_container_width=True, channels="BGR")
