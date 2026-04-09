@@ -189,16 +189,20 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         neighbors = d_list[1:]
         if np.max(neighbors) > max_valid_dist: continue
 
-        local_avg = np.mean(neighbors)
-        # Signed Strain using adjusted baseline
-        strain = (local_avg - baseline_dist) / baseline_dist
-        strain = strain * strain_factor
+        # Grab the specific coordinates for this dot and its neighbors
+        center_pt = points[i]
+        n_indices = indices[i, 1:]
+        neighbor_pts = points[n_indices]
+
+        # Route the data through your actual physics engine
+        sx, sy, ex, ey = calculate_plane_stress(
+            center_pt, neighbor_pts, baseline_dist, 
+            modulus_mpa, poisson_ratio, strain_factor
+        )
         
-        # MODIFIED: Convert strain to Stress (MPa) for the color map
-        stress_val = strain * modulus_mpa
-        
+        # Map the X-direction stress (sx) to the heatmap to match your label
         px, py = points[i]
-        heatmap_data.append([px, py, stress_val])
+        heatmap_data.append([px, py, sx])
 
     # ==========================================
     # FIND IMAGE MID POINT STRESS
