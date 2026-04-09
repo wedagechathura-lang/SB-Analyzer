@@ -248,8 +248,8 @@ def analyze_dot_pattern(image, modulus_mpa, poisson_ratio, strain_factor,
         
         # MODIFIED: FIXED SCALING (-15 to 15 MPa) 
         # This makes -15=Blue, 0=Green, +15=Red
-        vmin = -15.0
-        vmax = 15.0
+        vmin = -20.0
+        vmax = 20.0
         
         norm_map = (full_grid_z - vmin) / (vmax - vmin)
         norm_map = np.clip(norm_map, 0, 1)
